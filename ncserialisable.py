@@ -4,21 +4,18 @@ Objects in this module should work the same as the corresponding ones in
 in netCDF4.  The only differences are (should be):
 
  * Objects have some extra attributes which can't then be used as netCDF4
-   attributes (public ones are documented, others are '_'-prefixed).
+   attributes (these are all '_'-prefixed).
  * Some returned objects are replaced with wrappers from this module (for
    example, Dataset.variables contains Variable instead of netCDF4.Variable
    instances).
 
 For notes on serialisation, see the documentation for Dataset.
 
-    CLASSES
+If you want to replace netCDF4 with this module, so that libraries that use it
+don't need to change their imports, then before importing them, do:
 
-Dataset
-MFDataset
-Group
-[Dimension]
-Variable
-[CompoundType, VLType, MFTime]
+    import sys
+    sys.modules['netCDF4'] = sys.modules['ncserialisable']
 
 """
 
@@ -26,20 +23,20 @@ import types
 import copy_reg
 from pickle import UnpicklingError
 
-import netCDF4
-from ordereddict import OrderedDict # provided by netCDF4
+import netCDF4 as _netCDF4
+from netCDF4 import * # provides OrderedDict
 
 copy_reg.pickle(types.EllipsisType, lambda e: 'Ellipsis')
+
 
 class Dataset (object):
     """A netCDF4.Dataset wrapper that can be serialised.
 
 Takes the same arguments as netCDF4.Dataset.
 
-An instance passed for serialisation becomes closed; to disable this behaviour,
-set the instance's `close_on_serialise' attribute to False.  Each time the
+An instance passed for serialisation remains open itself, and each time the
 serialised data is unserialised, it yields an open Dataset pointing to the same
-file as the original Dataset.
+file as the original Dataset.  Make sure to close all of these.
 
 It is possible to pass a closed instance for serialisation, and the
 unserialised instance will still be open.
@@ -47,16 +44,13 @@ unserialised instance will still be open.
 Note that, for example, serialising and retrieving a Dataset and one of its
 Variable instances will yield a Dataset and Variable that are no longer
 connected.  Instead, do this with only one object in the hierarchy and retrieve
-the other objects through that one once retrieved.
+the other objects through that one once retrieved.  Serialising and retrieving
+a list containing the same object twice, however, will return the same object
+twice.
 
 This means that serialising and retrieving, for example, a Variable instance
 will create an open Dataset.  This should be accessed through the unserialised
 instance and closed when finished.
-
-    ATTRIBUTES
-
-closed: whether this instance is closed; don't change this.
-close_on_serialise: whether to close this instance when serialised.
 
 """
 
@@ -64,9 +58,9 @@ close_on_serialise: whether to close this instance when serialised.
         '_dataset_type', '_args', '_kwargs', '_wrapped', '_want_wrappeds'
     )
     _public_attrs = (
-        'closed', 'close_on_serialise', 'parent'
+        'parent',
     )
-    _dataset_type = netCDF4.Dataset
+    _dataset_type = _netCDF4.Dataset
 
     def __init__ (self, *args, **kwargs):
         self._init_dataset(args, kwargs)
@@ -78,8 +72,6 @@ close_on_serialise: whether to close this instance when serialised.
         self._wrapped = d = self._dataset_type(*args, **kwargs)
 
     def _init_public_attrs (self):
-        self.closed = False
-        self.close_on_serialise = True
         self.parent = None
 
     # magic wrappers
@@ -96,8 +88,6 @@ close_on_serialise: whether to close this instance when serialised.
         delattr(self._wrapped, attr)
 
     def __getattr__ (self, attr):
-        if attr is '_wrapped':
-            raise Exception()
         return getattr(self._wrapped, attr)
 
     def __setattr__ (self, attr, val):
@@ -121,8 +111,6 @@ close_on_serialise: whether to close this instance when serialised.
     # serialisation
 
     def __getstate__ (self):
-        if self.close_on_serialise:
-            self.close()
         # everything can be reconstructed from args to netCDF4.Dataset, plus
         # some public attributes we want to preserve
         attrs = dict((k, getattr(self, k)) for k in self._public_attrs)
@@ -161,7 +149,6 @@ close_on_serialise: whether to close this instance when serialised.
 
     def close (self):
         self._wrapped.close()
-        self.closed = True
 
     # TODO: createCompoundType, createDimension
 
@@ -188,6 +175,7 @@ close_on_serialise: whether to close this instance when serialised.
         v._name = newname
         vs[newname] = v
 
+
 class MFDataset (Dataset):
     """A netCDF4.MFDataset wrapper that can be serialised; Dataset subclass.
 
@@ -197,7 +185,8 @@ See Dataset for serialisation details.
 
 """
 
-    _dataset_type = netCDF4.MFDataset
+    _dataset_type = _netCDF4.MFDataset
+
 
 class Group (Dataset):
     """A netCDF4.Group wrapper that can be serialised.
@@ -226,6 +215,7 @@ Like with netCDF4.Group, you shouldn't create one of these directly.
         parent, name = state
         parent._want_wrappeds('groups', name, self)
         self.__init__(parent, None, name)
+
 
 class Variable (object):
     """A netCDF4.Variable wrapper that can be serialised.

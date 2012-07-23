@@ -5,13 +5,11 @@ in netCDF4.  The only differences are (should be):
 
  * Objects have some extra attributes which can't then be used as netCDF4
    attributes (public ones are documented, others are '_'-prefixed).
- * Dataset.close doesn't raise an exception when the Dataset is already closed.
  * Some returned objects are replaced with wrappers from this module (for
    example, Dataset.variables contains Variable instead of netCDF4.Variable
    instances).
- * Objects obtained from a Dataset are the same instance every time, and
-   Variable instances may still affect the data after being renamed (unlike in
-   netCDF4).
+
+For notes on serialisation, see the documentation for Dataset.
 
     CLASSES
 
@@ -43,13 +41,17 @@ set the instance's `close_on_serialise' attribute to False.  Each time the
 serialised data is unserialised, it yields an open Dataset pointing to the same
 file as the original Dataset.
 
-It is possible to pass a closed instance for serialisation, and the unserialised
-instance will still be open.
+It is possible to pass a closed instance for serialisation, and the
+unserialised instance will still be open.
 
 Note that, for example, serialising and retrieving a Dataset and one of its
 Variable instances will yield a Dataset and Variable that are no longer
 connected.  Instead, do this with only one object in the hierarchy and retrieve
 the other objects through that one once retrieved.
+
+This means that serialising and retrieving, for example, a Variable instance
+will create an open Dataset.  This should be accessed through the unserialised
+instance and closed when finished.
 
     ATTRIBUTES
 
@@ -59,11 +61,10 @@ close_on_serialise: whether to close this instance when serialised.
 """
 
     _private_attrs = (
-        '_dataset_type', '_args', '_kwargs', '_wrapped'
+        '_dataset_type', '_args', '_kwargs', '_wrapped', '_want_wrappeds'
     )
     _public_attrs = (
-        'closed', 'close_on_serialise',
-        'groups', 'variables', 'parent'
+        'closed', 'close_on_serialise', 'parent'
     )
     _dataset_type = netCDF4.Dataset
 
@@ -75,14 +76,6 @@ close_on_serialise: whether to close this instance when serialised.
         self._args = args
         self._kwargs = kwargs
         self._wrapped = d = self._dataset_type(*args, **kwargs)
-        # keeping lists of things around means they don't 'get detached'
-        for attr, cls in (
-            ('groups', Group),
-            ('variables', Variable)
-        ):
-            val = OrderedDict((k, cls(self, v, k)) \
-                              for k, v in getattr(d, attr).iteritems())
-            setattr(self, attr, val)
 
     def _init_public_attrs (self):
         self.closed = False
@@ -103,6 +96,8 @@ close_on_serialise: whether to close this instance when serialised.
         delattr(self._wrapped, attr)
 
     def __getattr__ (self, attr):
+        if attr is '_wrapped':
+            raise Exception()
         return getattr(self._wrapped, attr)
 
     def __setattr__ (self, attr, val):
@@ -110,6 +105,18 @@ close_on_serialise: whether to close this instance when serialised.
             self.__dict__[attr] = val
         else:
             setattr(self._wrapped, attr, val)
+
+    def _get_wrapped (self, attr, cls):
+        return OrderedDict((k, cls(self, v, k)) \
+                           for k, v in getattr(self._wrapped, attr).iteritems())
+
+    @property
+    def variables (self):
+        return self._get_wrapped('variables', Variable)
+
+    @property
+    def groups (self):
+        return self._get_wrapped('groups', Group)
 
     # serialisation
 
@@ -121,19 +128,40 @@ close_on_serialise: whether to close this instance when serialised.
         attrs = dict((k, getattr(self, k)) for k in self._public_attrs)
         return (self._args, self._kwargs, attrs)
 
+    def _want_wrapped (self, attr, key, instance):
+        if hasattr(self, '_wrapped'):
+            try:
+                return getattr(self._wrapped, attr)[key]
+            except KeyError:
+                err = 'tried to unpickle a {0} that no longer exists (\'{0}\')'
+                raise UnpicklingError(err.format(attr[:-1], key))
+        else:
+            if not hasattr(self, '_want_wrappeds'):
+                self._want_wrappeds = {}
+            self._want_wrappeds[attr] = (key, instance)
+
     def __setstate__ (self, state):
         args, kwargs, attrs = state
-        self._init(args, kwargs)
+        self._init_dataset(args, kwargs)
         self.__dict__.update(attrs)
+        if hasattr(self, '_want_wrappeds'):
+            for attr, wanting in self._want_wrappeds.iteritems():
+                wrappeds = getattr(self, attr)
+                for key, instance in wanting:
+                    try:
+                        instance._wrapped = wrappeds[key]
+                    except KeyError:
+                        err = 'tried to unpickle a {0} that no longer ' \
+                              'exists (\'{0}\' at \'{1}\')'
+                        err = err.format(attr[:-1], key, self.path)
+                        raise UnpicklingError(err)
+            del self._want_wrappeds
 
     # method wrappers
 
     def close (self):
-        if not self.closed:
-            self._wrapped.close()
-            # set closed after so it doesn't get set on Group instances (which
-            # will raise IOError in the above call)
-            self.closed = True
+        self._wrapped.close()
+        self.closed = True
 
     # TODO: createCompoundType, createDimension
 
@@ -196,12 +224,8 @@ Like with netCDF4.Group, you shouldn't create one of these directly.
 
     def __setstate__ (self, state):
         parent, name = state
-        try:
-            group = parent._wrapped.groups[name]
-        except KeyError:
-            err = 'tried to unpickle a group that no longer exists (\'{0}\')'
-            raise UnpicklingError(err.format(parent.path + name))
-        self.__init__(parent, group, name)
+        parent._want_wrappeds('groups', name, self)
+        self.__init__(parent, None, name)
 
 class Variable (object):
     """A netCDF4.Variable wrapper that can be serialised.
@@ -257,12 +281,7 @@ Like with netCDF4.Variable, you shouldn't create one of these directly.
 
     def __setstate__ (self, state):
         group, name = state
-        try:
-            variable = group._wrapped.variables[name]
-        except KeyError:
-            err = 'tried to unpickle a variable that no longer exists ' \
-                  '(\'{0}\' at \'{1}\')'.format(name, group.path)
-            raise UnpicklingError(err)
+        variable = group._want_wrapped('variables', name, self)
         self.__init__(group, variable, name)
 
     # method wrappers

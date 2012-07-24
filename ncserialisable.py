@@ -23,7 +23,7 @@ import types
 import copy_reg
 from pickle import UnpicklingError
 
-import netCDF4 as _netCDF4
+import netCDF4
 from netCDF4 import * # provides OrderedDict
 
 copy_reg.pickle(types.EllipsisType, lambda e: 'Ellipsis')
@@ -60,7 +60,7 @@ instance and closed when finished.
     _public_attrs = (
         'parent',
     )
-    _dataset_type = _netCDF4.Dataset
+    _dataset_type = netCDF4.Dataset
 
     def __init__ (self, *args, **kwargs):
         self._init_dataset(args, kwargs)
@@ -185,7 +185,7 @@ See Dataset for serialisation details.
 
 """
 
-    _dataset_type = _netCDF4.MFDataset
+    _dataset_type = netCDF4.MFDataset
 
 
 class Group (Dataset):

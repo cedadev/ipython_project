@@ -22,6 +22,7 @@ def mk_ellipsis ():
         return
 
     import types
+
     copy_reg.pickle(types.EllipsisType, lambda e: 'Ellipsis')
 
 # slots
@@ -63,7 +64,8 @@ def _construct_cf_units (attrs):
     u = object.__new__(cf.Units)
     for k, v in attrs.iteritems():
         setattr(u, k, v)
-    u.units = u.units
+    if hasattr(u, 'units'):
+        u.units = u.units
     return u
 
 def _reduce_cf_units (u):

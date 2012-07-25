@@ -26,8 +26,6 @@ from pickle import UnpicklingError
 import netCDF4
 from netCDF4 import * # provides OrderedDict
 
-copy_reg.pickle(types.EllipsisType, lambda e: 'Ellipsis')
-
 
 class Dataset (object):
     """A netCDF4.Dataset wrapper that can be serialised.
@@ -75,7 +73,12 @@ instance and closed when finished.
         self.parent = None
 
     # magic wrappers
-    # TODO: __enter__, __exit__
+
+    def __enter__ (self):
+        return self
+
+    def __exit__ (self, *args):
+        self.close()
 
     def __str__ (self):
         return '{0}({1})'.format(self.__class__.__name__, str(self._wrapped))

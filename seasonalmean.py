@@ -71,7 +71,7 @@ def run (files, var_name, parallel = True, season_length = 90, engines = None,
 run(files, var_name, parallel = True, season_length = 90, engines = None,
     var_path = '/', time_path = '/', time_name = 'time') -> results
 
-files: a list of the netCDF data files to use, or just one.
+files: as taken by netCDF4.MFDataset.
 var_name: the name of the variable to compute the mean of.
 parallel: whether to run the computation in parallel (using IPython.parallel).
 season_length: the length of a 'season' in whatever units the time variable has
@@ -86,8 +86,6 @@ time_name: the name of the time variable.  This can actually be any
 results: the array for the var variable, with time now in seasons.
 
 """
-    if isinstance(files, basestring):
-        files = [files]
     if parallel:
         c = Client()
         dv = c[:]

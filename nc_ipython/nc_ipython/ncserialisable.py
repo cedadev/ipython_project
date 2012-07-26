@@ -143,9 +143,14 @@ Diskless operation is not supported.
                                   unicode(self._wrapped))
 
     def __delattr__ (self, attr):
-        delattr(self._wrapped, attr)
+        if attr in self._private_attrs:
+            del self.__dict__[attr]
+        else:
+            delattr(self._wrapped, attr)
 
     def __getattr__ (self, attr):
+        val = getattr(self._wrapped, attr)
+        # replace object dicts with dicts of wrappers
         cls = {
             'cmptypes': CompoundType,
             'dimensions': Dimension,
@@ -153,20 +158,15 @@ Diskless operation is not supported.
             'vltypes': VLType,
             'variables': Variable
         }.get(attr, None)
-        if cls is None:
-            return getattr(self._wrapped, attr)
-        else:
-            return self._get_wrapped(attr, cls)
+        if cls is not None:
+            return OrderedDict((k, cls(self, v, k)) \
+                               for k, v in val.iteritems())
 
     def __setattr__ (self, attr, val):
         if attr in self._private_attrs + self._public_attrs:
             self.__dict__[attr] = val
         else:
             setattr(self._wrapped, attr, val)
-
-    def _get_wrapped (self, attr, cls):
-        return OrderedDict((k, cls(self, v, k)) \
-                           for k, v in getattr(self._wrapped, attr).iteritems())
 
     # serialisation
 
@@ -176,34 +176,62 @@ Diskless operation is not supported.
         attrs = dict((k, getattr(self, k)) for k in self._public_attrs)
         return (self._args, self._kwargs, attrs)
 
-    def _want_wrapped (self, attr, key, instance, group = None):
-        if group is None:
-            group = self
-        if hasattr(group, '_wrapped'):
+    def _want_wrapped (self, attr, key, instance, dataset = None):
+        """Signal the Dataset that a netCDF4 object to wrap is needed.
+
+This is used in unserialising objects.  This instance may be initialised after
+some other objects, and if so, this method stores a request for the desired
+object.
+
+_want_wrapped (attr, key, instance[, dataset]) -> wrapped
+
+attr, key: wrapped is obtained through getattr(ndataset, attr)[key], where
+           ndataset is the netCDF4.Dataset instance.
+instance: the object calling this function.
+dataset: the Dataset instance to obtain ndataset from; defaults to this
+         instance.  If given, this must be guaranteed to be unserialised before
+         this instance (and so realistically, only dataset itself should pass
+         this argument).
+
+wrapped: the object, if it can be obtained now.  If this instance has not yet
+         been initialised, this is None, and instance._wrapped will be done
+         later (before this instance's unserialisation finishes).
+
+"""
+        if dataset is None:
+            dataset = self
+        if hasattr(dataset, '_wrapped'):
+            # obtain and return the object now
             try:
-                return getattr(group._wrapped, attr)[key]
+                return getattr(dataset._wrapped, attr)[key]
             except KeyError:
-                err = 'tried to unpickle a {0} that no longer exists (\'{0}\')'
-                raise UnpicklingError(err.format(attr[:-1], key))
+                err = 'tried to unpickle a {0} that no longer exists ' \
+                      '(\'{0}\' at \'{1}\')'
+                raise UnpicklingError(err.format(attr[:-1], key, dataset.path))
         else:
+            # not initialised yet: store a request
             if not hasattr(self, '_want_wrappeds'):
                 self._want_wrappeds = {}
-            self._want_wrappeds[attr] = (group, key, instance)
+            if (dataset, attr) in self._want_wrappeds:
+                self._want_wrappeds[(dataset, attr)].append((key, instance))
+            else:
+                self._want_wrappeds[(dataset, attr)] = [(key, instance)]
 
     def __setstate__ (self, state):
         args, kwargs, attrs = state
         self._init_dataset(args, kwargs, True)
         self.__dict__.update(attrs)
+        # handle wrapped requests (see _want_wrapped)
         if hasattr(self, '_want_wrappeds'):
-            for group, attr, wanting in self._want_wrappeds.iteritems():
-                wrappeds = getattr(group, attr)
+            for (dataset, attr), wanting in self._want_wrappeds.iteritems():
+                wrappeds = getattr(dataset, attr)
                 for key, instance in wanting:
                     try:
                         instance._wrapped = wrappeds[key]
                     except KeyError:
                         err = 'tried to unpickle a {0} that no longer ' \
                               'exists (\'{0}\' at \'{1}\')'
-                        err = err.format(attr[:-1], key, group.path)
+                        err = err.format(attr[:-1], key, dataset.path)
                         raise UnpicklingError(err)
             del self._want_wrappeds
 

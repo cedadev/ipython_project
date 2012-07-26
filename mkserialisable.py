@@ -3,10 +3,10 @@
 Each of the functions in this module makes a specific type of object
 serialisable.  Here's a summary (see function documentation for details):
 
-mk_ellipsis: the Ellipsis builtin.
-mk_slots: classes that have __slots__ but not __dict__.
-mk_netcdf: the netCDF4 module.
-mk_cf: the cf module.
+mk_ellipsis: Ellipsis.
+mk_slots: classes with __slots__ but not __dict__.
+mk_netcdf: netCDF4.
+mk_cf: cf.
 
 """
 
@@ -21,9 +21,7 @@ def mk_ellipsis ():
     if 'ellipsis' in _done:
         return
 
-    import types
-
-    copy_reg.pickle(types.EllipsisType, lambda e: 'Ellipsis')
+    copy_reg.pickle(type(Ellipsis), lambda e: 'Ellipsis')
 
 # slots
 
@@ -38,16 +36,24 @@ def _reduce_slots (o):
     return _construct_slots, (type(o), attrs,)
 
 def mk_slots (*objs):
-    """Make the given classes with __slots__ but not __dict__ serialisable."""
+    """Make the classes that have __slots__ but not __dict__ serialisable.
+
+Takes a number of types (new-style classes) to make serialisable.
+
+"""
     for cls in objs:
         copy_reg.pickle(cls, _reduce_slots)
 
 # netcdf
 
 def mk_netcdf ():
-    """Make the netCDF4 module serialisable.
+    """Make objects in the netCDF4 module serialisable.
 
-Depends on ncserialisable; see that module's documentation for details.
+Depends on ncserialisable; see that module's documentation for details.  This
+replaces the netCDF4 module with ncserialisable directly through sys.modules;
+to access netCDF4 directly, use ncserialisable.netCDF4.
+
+Call this before importing any module that uses netCDF4.
 
 """
     if 'netcdf' in _done:
@@ -73,9 +79,11 @@ def _reduce_cf_units (u):
     return _construct_cf_units, (attrs,)
 
 def mk_cf ():
-    """Make the cf module serialisable.
+    """Make objects in the cf module serialisable.
 
 Calls mk_netcdf, and so depends on ncserialisable.
+
+Call this before importing cf.
 
 """
     if 'cf' in _done:

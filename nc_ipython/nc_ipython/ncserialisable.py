@@ -8,6 +8,7 @@ in netCDF4.  The only differences are (should be):
  * Some returned objects are replaced with wrappers from this module (for
    example, Dataset.variables contains Variable instead of netCDF4.Variable
    instances).
+ * CompoundType instances have a group attribute
 
 For notes on serialisation, see the documentation for Dataset.
 
@@ -25,6 +26,48 @@ from pickle import UnpicklingError
 
 import netCDF4
 from netCDF4 import * # provides OrderedDict
+
+class CompoundType (object):
+    """A netCDF4.CompoundType wrapper that can be serialised.
+
+Takes a Dataset instance, a netCDF4.CompoundType instance to wrap and the
+type's name.
+
+Like with netCDF4.CompoundType, you shouldn't create one of these directly.
+
+A CompoundType doesn't provide a way of retrieving its Dataset to close it (see
+Dataset documentation for why this is necessary).  For this reason, this
+wrapper provides a `group' attribute, which contains the Group instance it was
+created through.
+
+"""
+
+    _private_attrs = ('group', '_wrapped', '_name')
+
+    def __init__ (self, group, cmptype, name):
+        self.group = group
+        self._wrapped = cmptype
+        self._name = name
+
+    # magic wrappers
+
+    def __str__ (self):
+        return '{0}({1})'.format(self.__class__.__name__, str(self._wrapped))
+
+    def __unicode__ (self):
+        return u'{0}({1})'.format(self.__class__.__name__,
+                                  unicode(self._wrapped))
+
+    # serialisation
+
+    def __getstate__ (self):
+        return (self.group, self._name)
+
+    def __setstate__ (self, state):
+        group, name = state
+        cmptype = group._want_wrapped('cmptypes', name, self)
+        self.__init__(group, cmptype, name)
+
 
 class Dataset (object):
     """A netCDF4.Dataset wrapper that can be serialised.
@@ -116,6 +159,10 @@ Diskless operation is not supported.
                            for k, v in getattr(self._wrapped, attr).iteritems())
 
     @property
+    def cmptypes (self):
+        return self._get_wrapped('cmptypes', CompoundType)
+
+    @property
     def dimensions (self):
         return self._get_wrapped('dimensions', Dimension)
 
@@ -130,37 +177,41 @@ Diskless operation is not supported.
     # serialisation
 
     def __getstate__ (self):
+        print 'get', self.__class__.__name__, id(self)
         # everything can be reconstructed from args to netCDF4.Dataset, plus
         # some public attributes we want to preserve
         attrs = dict((k, getattr(self, k)) for k in self._public_attrs)
         return (self._args, self._kwargs, attrs)
 
-    def _want_wrapped (self, attr, key, instance):
-        if hasattr(self, '_wrapped'):
+    def _want_wrapped (self, attr, key, instance, group = None):
+        if group is None:
+            group = self
+        if hasattr(group, '_wrapped'):
             try:
-                return getattr(self._wrapped, attr)[key]
+                return getattr(group._wrapped, attr)[key]
             except KeyError:
                 err = 'tried to unpickle a {0} that no longer exists (\'{0}\')'
                 raise UnpicklingError(err.format(attr[:-1], key))
         else:
             if not hasattr(self, '_want_wrappeds'):
                 self._want_wrappeds = {}
-            self._want_wrappeds[attr] = (key, instance)
+            self._want_wrappeds[attr] = (group, key, instance)
 
     def __setstate__ (self, state):
+        print 'set', self.__class__.__name__, id(self)
         args, kwargs, attrs = state
         self._init_dataset(args, kwargs, True)
         self.__dict__.update(attrs)
         if hasattr(self, '_want_wrappeds'):
-            for attr, wanting in self._want_wrappeds.iteritems():
-                wrappeds = getattr(self, attr)
+            for group, attr, wanting in self._want_wrappeds.iteritems():
+                wrappeds = getattr(group, attr)
                 for key, instance in wanting:
                     try:
                         instance._wrapped = wrappeds[key]
                     except KeyError:
                         err = 'tried to unpickle a {0} that no longer ' \
                               'exists (\'{0}\' at \'{1}\')'
-                        err = err.format(attr[:-1], key, self.path)
+                        err = err.format(attr[:-1], key, group.path)
                         raise UnpicklingError(err)
             del self._want_wrappeds
 
@@ -169,7 +220,9 @@ Diskless operation is not supported.
     def close (self):
         self._wrapped.close()
 
-    # TODO: createCompoundType
+    def createDimension (self, datatype, datatype_name):
+        t = self._wrapped.createDimension(datatype, datatype_name)
+        return Dimension(self, t, datatype_name)
 
     def createDimension (self, dimname, size = None):
         d = self._wrapped.createDimension(dimname, size)
@@ -231,9 +284,11 @@ Like with netCDF4.Dimension, you shouldn't create one of these directly.
     # serialisation
 
     def __getstate__ (self):
+        print 'get', self.__class__.__name__, id(self)
         return (self._group, self._name)
 
     def __setstate__ (self, state):
+        print 'set', self.__class__.__name__, id(self)
         group, name = state
         dimension = group._want_wrapped('dimensions', name, self)
         self.__init__(group, dimension, name)
@@ -263,13 +318,17 @@ Like with netCDF4.Group, you shouldn't create one of these directly.
 
     # serialisation
 
-    def _want_wrapped (self, *args, **kwargs):
-        return self.parent._want_wrapped(*args, **kwargs)
+    def _want_wrapped (self, attr, key, instance, group = None):
+        if group is None:
+            group = self
+        return self.parent._want_wrapped(attr, key, instance, group)
 
     def __getstate__ (self):
+        print 'get', self.__class__.__name__, id(self)
         return (self.parent, self._name)
 
     def __setstate__ (self, state):
+        print 'set', self.__class__.__name__, id(self)
         parent, name = state
         group = parent._want_wrapped('groups', name, self)
         self.__init__(parent, group, name)
@@ -325,9 +384,11 @@ Like with netCDF4.Variable, you shouldn't create one of these directly.
     # serialisation
 
     def __getstate__ (self):
+        print 'get', self.__class__.__name__, id(self)
         return (self._group, self._name)
 
     def __setstate__ (self, state):
+        print 'set', self.__class__.__name__, id(self)
         group, name = state
         variable = group._want_wrapped('variables', name, self)
         self.__init__(group, variable, name)

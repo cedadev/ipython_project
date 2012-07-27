@@ -1,7 +1,10 @@
 """Routines to make objects serialisable.
 
 Each of the functions in this module makes a specific type of object
-serialisable.  Here's a summary (see function documentation for details):
+serialisable.  In most cases, this module needs to be imported and the function
+run in both the serialising and the unserialising environments.
+
+Here's a summary (see function documentation for details):
 
 mk_ellipsis: Ellipsis.
 mk_slots: classes with __slots__ but not __dict__.

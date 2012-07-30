@@ -93,7 +93,6 @@ results: the array for the var variable, with time now in seasons.
             dv.targets = engines
         dv.block = True
         dv.execute('import numpy')
-        dv.execute('from ncserialisable import MFDataset')
 
     d = MFDataset(files)
     try:

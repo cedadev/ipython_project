@@ -6,28 +6,33 @@ from os.path import join as join_path
 from optparse import OptionParser
 from subprocess import Popen, PIPE, STDOUT
 from pipes import quote
+from webbrowser import open as open_url
 
-# detect when the ssh keypair isn't installed and advise the user (hint: ssh-agent sets various environment variables)
+# option: open the browser automatically (from webbrowser import open as open_url)
+# warn if no ssh-agent running
+# warn (or error?) if ssh keypair isn't installed (ssh-agent sets various environment variables)
+# check for conflicting port forwarding in ssh config and warn
+# view/set ipython configuration files on JASMIN
+#   don't overwrite config files on upload
+#       option: save dated backups or just overwrite
+#   check (remote) ipython environment variables for path, or take as option
+#   particularly to allow configuration of ipython-cluster to utilise the right number of nodes
+#       can have a default number of engines in notebook cluster tab?
+# take extra arguments to pass to the ipython command (--pylab=inline --no-mathjax)
 # option: script to run on login
 # option: commands to run on login
-# check for conflicting port forwarding in ssh config and warn
-# don't overwrite config files on upload
-#   optionally save dated backups or just overwrite
-# can have a default number of engines in notebook cluster tab?
-# take extra arguments to pass to the ipython command (--pylab=inline --no-mathjax)
-# option: open the browser automatically
-# view ipython configuration files on JASMIN
-# set ipython configuration files on JASMIN by uploading them from their desktop
-#   particularly to allow configuration of ipython-cluster to utilise the right number of nodes
+# option: run notebook server locally and cluster remotely
+# why are the '\r's needed?
 
 ERR_EXEC = 1
-# optparse returns 2 for option-parsing errors
+# optparse uses 2 for option-parsing errors
 ERR_NET = 3
 
 defaults = {
     'local_port': 8888,
     'remote_port': 8888,
     'ipython': 'ipython',
+    'browser': False,
     'verbose': False
 }
 
@@ -46,19 +51,28 @@ def finish (sig, process):
 
 def error (msg, code, process = None):
     """Print an error message and exit."""
-    print >> sys.stdout, 'error:', msg + '\r'
+    print >> sys.stderr, '[ERROR]', msg
     if process is not None:
         finish(SIGTERM, process)
         process.wait()
     sys.exit(code)
 
-def info (*msgs):
-    print '[INFO]',
-    for msg in msgs[:-1]:
-        print msg,
-    print msgs[-1]
+def mk_printer (category, dest = sys.stdout, need_verbose = False):
+    """Create and return a function that prints messages."""
+    def printer (*msgs):
+        if need_verbose and not verbose:
+            return
+        print >> dest, '[{0}]'.format(category.upper()),
+        for msg in msgs[:-1]:
+            print >> dest, msg,
+        print >> dest, msgs[-1]
+    return printer
 
-def run (host, local_port, remote_port, directory, ipython, verbose):
+info = mk_printer('info', need_verbose = True)
+warn = mk_printer('warning', sys.stderr)
+
+def run (host, local_port, remote_port, directory, ipython, browser):
+    """Do everything."""
     # construct ipython command
     ipython_cmd = (ipython, 'notebook', '--no-browser',
                    '--port={0}'.format(remote_port))
@@ -77,8 +91,7 @@ def run (host, local_port, remote_port, directory, ipython, verbose):
     ssh_opts.append('-L{0}:localhost:{1}'.format(local_port, remote_port))
     ssh_cmd = ['ssh'] + ssh_opts + [host, '\n'.join(cmds)]
     # run command
-    if verbose:
-        info('running command:', '\'{0}\'\n'.format('\' \''.join(ssh_cmd)))
+    info('running command:', '\'{0}\'\n'.format('\' \''.join(ssh_cmd)))
     process = Popen(ssh_cmd, stdout = PIPE, stderr = STDOUT)
     # set up signal handlers
     signal(SIGINT, lambda sig, frame: finish(sig, process))
@@ -95,7 +108,7 @@ def run (host, local_port, remote_port, directory, ipython, verbose):
             if str(remote_port) + '/' not in s:
                 # printed port isn't the one we wanted
                 error('couldn\'t set up port forwarding: remote port ({0}) ' \
-                      'is in use'.format(remote_port), ERR_NET, process)
+                      'is in use\r'.format(remote_port), ERR_NET, process)
             else:
                 # replace remote with local port
                 sys.stdout.write(s.replace(str(remote_port), str(local_port)))
@@ -105,7 +118,12 @@ def run (host, local_port, remote_port, directory, ipython, verbose):
         if s.startswith(err_line):
             # ssh error
             error('couldn\'t set up port forwarding: local port ({0}) is ' \
-                  'in use'.format(local_port), ERR_NET, process)
+                  'in use\r'.format(local_port), ERR_NET, process)
+    # open in browser
+    if browser:
+        url = 'http://127.0.0.1:{0}'.format(local_port)
+        info('opening browser to {0}\r'.format(url))
+        open_url(url)
     # no way to switch output back to stdout, so we need to relay everything
     while True:
         # read one character at a time so that input is echoed immediately
@@ -118,8 +136,7 @@ def run (host, local_port, remote_port, directory, ipython, verbose):
     ret = process.wait()
     # handle errors indicated by return code (TODO)
     # NOTE: ssh error exit code is 255, else command's exit code
-    if verbose:
-        info('return code:', ret)
+    info('return code:', ret)
 
 if __name__ == '__main__':
     # parse arguments
@@ -134,16 +151,21 @@ if __name__ == '__main__':
     op.add_option('-d', '--directory', action = 'store', type = 'string',
                   help = 'directory to run the notebook server in (default: ' \
                          'initial directory)')
+    op.add_option('-b', '--browser', action = 'store_true',
+                  help = 'open the notebook in a web browser')
     op.add_option('-i', '--ipython', action = 'store', type = 'string',
                   help = 'path to ipython executable (default: %default)')
     op.add_option('-v', '--verbose', action = 'store_true')
     op.set_defaults(**defaults)
     options, args = op.parse_args()
-    if options.verbose:
-        info('recieved options:', str(options))
-        info('recieved arguments:', str(args))
+    # handle arguments
+    global verbose
+    verbose = options.verbose
+    del options.verbose
+    info('recieved options:', str(options))
+    info('recieved arguments:', str(args))
     if len(args) < 1:
-        op.error('expected \'host\' argument')
+        op.error('expected HOST argument')
     elif len(args) > 1:
         op.error('got more arguments than expected')
     # run script

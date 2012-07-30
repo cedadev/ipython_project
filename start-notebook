@@ -4,23 +4,30 @@ import sys
 from signal import signal, SIGINT, SIGTERM
 import os
 from os.path import join as join_path
-from optparse import OptionParser
+from optparse import OptionParser, IndentedHelpFormatter
 from subprocess import Popen, PIPE, STDOUT
 from pipes import quote
 from webbrowser import open as open_url
 
-# check for conflicting port forwarding in ssh config and warn
 # view/set ipython configuration files on JASMIN
 #   don't overwrite config files on upload
 #       option: save dated backups or just overwrite
 #   check (remote) ipython environment variables for path, or take as option
 #   particularly to allow configuration of ipython-cluster to utilise the right number of nodes
 #       can have a default number of engines in notebook cluster tab?
-# take extra arguments to pass to the ipython command (--pylab=inline --no-mathjax)
 # option: script to run on login
 # option: commands to run on login
 # option: run notebook server locally and cluster remotely
 # why are the '\r's needed?
+
+class Formatter (IndentedHelpFormatter):
+    """optparse text formatter to handle multiple description paragraphs."""
+
+    def format_description (self, description):
+        return '\n'.join(
+            IndentedHelpFormatter.format_description(self, paragraph) \
+            for paragraph in description.split('\n\n')
+        )
 
 ERR_EXEC = 1
 # optparse uses 2 for option-parsing errors
@@ -34,14 +41,17 @@ defaults = {
     'verbose': False
 }
 
-desc = '''This script starts an IPython notebook server on the JASMIN virtual \
-machine at the given address (HOST argument).  The web interface is forwarded \
-over an SSH connection to a local port, defaulting to {0}.  Make sure your \
-SSH keys are in place.'''.format(defaults['local_port'])
+desc = '''This script starts an IPython notebook server on the JASMIN virtual
+machine found at HOST.  The web interface is forwarded over an SSH connection
+to a local port.  Make sure your SSH keys are in place.
 
-note = '''Before starting the notebook on JASMIN, your shell will be run as a \
-login shell, which means loading, eg. ~/.bash_profile.  Bear this in mind \
-when passing the --directory and --ipython options.'''
+IPYTHON_OPTS are any number of extra arguments to pass to the ipython command.
+This should not include the --port option.  If any start with `-', make sure to
+pass `--' first.
+
+Before starting the notebook on JASMIN, your shell will be run as a login
+shell, which means loading, eg. ~/.bash_profile.  Bear this in mind  when
+passing the --directory and --ipython options.'''
 
 def finish (sig, process):
     """Signal handler."""
@@ -87,6 +97,7 @@ def check_ssh (local_port, remote_port):
             #no_agent = True
     #if no_agent:
         #warn('ssh-agent doesn\'t appear to be running')
+
     # check for ssh-agent: let ssh-add do the work
     try:
         p = Popen(('ssh-add', '-l'), stdout = PIPE, stderr = STDOUT)
@@ -100,12 +111,13 @@ def check_ssh (local_port, remote_port):
         elif rtn == 2:
             warn('ssh-agent doesn\'t appear to be running')
 
-def start_notebook (host, local_port, remote_port, directory, ipython, browser):
+def start_notebook (host, ipython_args, local_port, remote_port, directory,
+                    ipython, browser):
     """Start the IPython notebook on the VM."""
     check_ssh(local_port, remote_port)
     # construct ipython command
     ipython_cmd = (ipython, 'notebook', '--no-browser',
-                   '--port={0}'.format(remote_port))
+                   '--port={0}'.format(remote_port)) + tuple(ipython_args)
     # construct shell commands
     # 'ssh <command>' runs '$SHELL -c <command>'
     if directory is not None:
@@ -178,19 +190,20 @@ def start_notebook (host, local_port, remote_port, directory, ipython, browser):
 
 if __name__ == '__main__':
     # parse arguments
-    op = OptionParser(usage = '%prog [OPTIONS] HOST', version = '%prog 0.1.0',
-                      description = desc, epilog = note)
+    usage = '%prog [OPTIONS] [--] HOST [IPYTHON_OPTS...]'
+    op = OptionParser(usage = usage, version = '%prog 0.1.0',
+                      description = desc, formatter = Formatter())
     op.add_option('-l', '--local-port', action = 'store', type = 'int',
-                  help = 'port to run the notebook on on this machine ' \
-                         '(default: %default)')
+                  help = 'local port to forward the connection to (default: ' \
+                         '%default)')
     op.add_option('-r', '--remote-port', action = 'store', type = 'int',
-                  help = 'port to run the notebook on on the remote machine' \
+                  help = 'port on the remote machine to run the notebook on ' \
                          '(default: %default)')
     op.add_option('-d', '--directory', action = 'store', type = 'string',
                   help = 'directory to run the notebook server in (default: ' \
                          'initial directory)')
     op.add_option('-b', '--browser', action = 'store_true',
-                  help = 'open the notebook in a web browser')
+                  help = 'open the web interface in a web browser')
     op.add_option('-i', '--ipython', action = 'store', type = 'string',
                   help = 'path to ipython executable (default: %default)')
     op.add_option('-v', '--verbose', action = 'store_true')
@@ -200,12 +213,10 @@ if __name__ == '__main__':
     global verbose
     verbose = options.verbose
     del options.verbose
-    info('recieved options:', str(options))
-    info('recieved arguments:', str(args))
+    info('received options:', str(options))
+    info('received arguments:', str(args))
     if len(args) < 1:
         op.error('expected HOST argument')
-    elif len(args) > 1:
-        op.error('got more arguments than expected')
     # start notebook
-    ret = start_notebook(*args, **options.__dict__)
+    ret = start_notebook(args[0], args[1:], **options.__dict__)
     sys.exit(ret)

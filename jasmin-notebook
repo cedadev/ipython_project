@@ -1,5 +1,7 @@
 #! /usr/bin/env python
 
+from __future__ import with_statement
+
 from sys import exit, argv, stdout, stderr
 from signal import signal, SIGINT, SIGTERM
 import os
@@ -9,11 +11,19 @@ from subprocess import Popen, PIPE, STDOUT
 from pipes import quote as quote_single
 from webbrowser import open as open_url
 
-# option: script to run on login (local or remote)
-# option: commands to run on login
-# option: run notebook server locally and cluster remotely
-# why are the '\r's needed?
+# TODO:
+# - option: run bash as a login shell
+# - option: don't load bash configs
+# - subcommand to list ipython config files for a profile
+# - subcommand to create ipython profile (ipython profile create [--parallel])
+# - getconf - print to stdout, redirect ssh stuff to stderr
+# - version check/error against sys.version_info
+# - option: script to run on login (local or remote)
+# - option: commands to run on login
+# - option: run notebook server locally and cluster remotely
+# - why are the '\r's needed?
 
+# utilities
 
 class Formatter (optparse.IndentedHelpFormatter):
     """optparse text formatter to handle multiple description paragraphs."""
@@ -40,10 +50,11 @@ def finish (sig, process):
     process.send_signal(sig)
 
 def printer_head (category):
+    """Construct line start used by message printers."""
     if loud:
-        return '[{0}]'.format(category.upper())
+        return '[%s]' % (category.upper(),)
     else:
-        return '{0}:'.format(category.lower())
+        return '%s:' % (category.lower(),)
 
 def error (msg, code, process = None):
     """Print an error message and exit."""
@@ -81,7 +92,9 @@ The output can be safely run in a shell.
 
 """
     escaped_cmd = ' '.join(quote(arg) for arg in cmd)
-    info('running command:', '[[[ {0} ]]]'.format(escaped_cmd))
+    info('running command:', '[[[ %s ]]]' % (escaped_cmd,))
+
+# subcommands
 
 def check_ssh ():
     """Check local SSH environment for problems."""
@@ -105,7 +118,7 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
     check_ssh()
     # construct ipython command
     ipython_cmd = [quote(ipython), 'notebook', '--no-browser']
-    ipython_cmd.append('--port={0}'.format(remote_port))
+    ipython_cmd.append('--port=%s' % (remote_port,))
     ipython_cmd += quote(ipython_args)
     # construct shell commands - make sure to quote input
     if directory is not None:
@@ -121,8 +134,8 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
     # construct ssh command
     # 'ssh <command>' runs '$SHELL -c <command>'
     ssh_opts = ['-t']
-    ssh_opts.append('-L{0}:localhost:{1}'.format(local_port, remote_port))
-    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c {0}'.format(quote(cmds))]
+    ssh_opts.append('-L%s:localhost:%s' % (local_port, remote_port))
+    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c %s' % (quote(cmds),)]
     # run command
     print_popen_cmd(ssh_cmd)
     try:
@@ -144,8 +157,8 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
         if s.startswith(search_line):
             if str(remote_port) + '/' not in s:
                 # printed port isn't the one we wanted
-                error('couldn\'t set up port forwarding: remote port ({0}) ' \
-                      'is in use\r'.format(remote_port), ERR_NET, process)
+                error('couldn\'t set up port forwarding: remote port (%s) ' \
+                      'is in use\r' % (remote_port,), ERR_NET, process)
             else:
                 # replace remote with local port
                 stdout.write(s.replace(str(remote_port), str(local_port)))
@@ -155,12 +168,12 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
         stdout.write(s)
         if s.startswith(err_line):
             # ssh error
-            error('couldn\'t set up port forwarding: local port ({0}) is ' \
-                  'in use\r'.format(local_port), ERR_NET, process)
+            error('couldn\'t set up port forwarding: local port (%s) is in ' \
+                  'use\r' % (local_port,), ERR_NET, process)
     # open in browser
     if success and browser:
-        url = 'http://127.0.0.1:{0}/'.format(local_port)
-        info('opening browser to {0}\r'.format(url))
+        url = 'http://127.0.0.1:%s/' % (local_port,)
+        info('opening browser to %s\r' % (url,))
         open_url(url)
     # no way to switch output back to stdout, so we need to relay everything
     while True:
@@ -182,18 +195,19 @@ Returns a tuple of commands; the first must be executed directly, after which
 the second is safe to use as an expression that gives the file path.
 
 """
-    return ('d="$(ipython locate profile {0})"'.format(quote(profile)),
-            '"$d"/{0}_config.py'.format(quote(component)))
+    return ('d="$(ipython locate profile %s)"' % (quote(profile),),
+            '"$d"/%s_config.py' % (quote(component),))
 
 def getconf (host, component, profile, ipython):
     """Get an IPython configuration file from the VM."""
+    check_ssh()
     # construct command
     do, f = cmd_for_config_file(profile, component)
-    cmds = '{0} && cat {1}'.format(do, f)
+    cmds = '%s && cat %s' % (do, f)
     ssh_opts = []
     if not verbose:
         ssh_opts.append('-q')
-    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c {0}'.format(quote(cmds))]
+    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c %s' % (quote(cmds),)]
     # run command
     print_popen_cmd(ssh_cmd)
     try:
@@ -210,6 +224,7 @@ def getconf (host, component, profile, ipython):
 def setconf (host, component, profile, local_profile, local_file, no_clobber,
              ipython):
     """Upload an IPython configuration file to the VM."""
+    check_ssh()
     # find local file
     if local_file is None:
         if local_profile is None:
@@ -225,19 +240,19 @@ def setconf (host, component, profile, local_profile, local_file, no_clobber,
                 break
         if local_file is None:
             # didn't find anything
-            msg = 'couldn\'t find {0} under profile {1}'
-            error(msg.format(file_name, local_profile), ERR_OTHER)
+            msg = 'couldn\'t find %s under profile %s'
+            error(msg % (file_name, local_profile), ERR_OTHER)
     # construct command
     cmds = []
     if no_clobber:
         cmds.append('set -o noclobber') # assuming Bash
     do, f = cmd_for_config_file(profile, component)
-    cmds.append('{0} && tee > {1}'.format(do, f))
+    cmds.append('%s && tee > %s' % (do, f))
     cmds = '\n'.join(cmds)
     ssh_opts = []
     if not verbose:
         ssh_opts.append('-q')
-    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c {0}'.format(quote(cmds))]
+    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c %s' % (quote(cmds),)]
     # run command
     print_popen_cmd(ssh_cmd)
     try:
@@ -245,12 +260,11 @@ def setconf (host, component, profile, local_profile, local_file, no_clobber,
     except OSError:
         error('couldn\'t run ssh', ERR_EXEC)
     # pass config file on stdin
-    # TODO: handle read errors
     try:
         with open(local_file, 'r') as f:
             data = f.read()
     except (IOError, OSError):
-        error('couldn\'t read file \'{0}\''.format(local_file), ERR_OTHER)
+        error('couldn\'t read file \'%s\'' % (local_file,), ERR_OTHER)
     process.communicate(data)
     ret = process.returncode
     if not verbose and ret == 255:
@@ -265,7 +279,7 @@ def help_cmd (cmd = None):
         op = mk_op_basic(*COMMANDS)
     elif cmd not in COMMANDS:
         op = mk_op_basic(*COMMANDS)
-        op.error('help: invalid command: \'{0}\''.format(cmd))
+        op.error('help: invalid command: \'%s\'' % (cmd,))
     else:
         op = mk_op(cmd)
     op.print_help()
@@ -282,11 +296,12 @@ def translate_ret (ret):
     else:
         return ERR_UNKNOWN
 
+# option parser constructors
 
 def mk_op_basic (*cmds):
     """Initialise an optparse.OptionParser for all of the given commands."""
     # usage has one line per subcommand
-    usage = [USAGES[c].format(c) for c in cmds]
+    usage = [USAGES[c] for c in cmds]
     for i in xrange(1, len(usage)):
         usage[i] = ' ' * len('Usage: ') + usage[i]
     usage = '\n'.join(usage)
@@ -330,7 +345,6 @@ def mk_op (cmd):
         op.add_option(o_ipython)
         op.add_option(o_verbose)
     elif cmd == 'setconf':
-        # NOTE: # engines setting
         op.add_option(o_profile)
         op.add_option('-l', '--local-profile', action = 'store',
                       type = 'string',
@@ -350,6 +364,7 @@ def mk_op (cmd):
         op.description += '\\n\n'
     return op
 
+# subcommand configuration
 
 ERR_EXEC = 1
 ERR_ARGS = 2 # optparse uses this
@@ -360,10 +375,10 @@ ERR_UNKNOWN = 5
 COMMANDS = ('start', 'getconf', 'setconf', 'help')
 
 USAGES = {
-    'start': '%prog {0} [OPTIONS] [--] HOST [IPYTHON_OPTS...]',
-    'getconf': '%prog {0} [OPTIONS] HOST COMPONENT',
-    'setconf': '%prog {0} [OPTIONS] HOST COMPONENT',
-    'help': '%prog {0} SUBCOMMAND'
+    'start': '%prog start [OPTIONS] [--] HOST [IPYTHON_OPTS...]',
+    'getconf': '%prog getconf [OPTIONS] HOST COMPONENT',
+    'setconf': '%prog setconf [OPTIONS] HOST COMPONENT',
+    'help': '%prog help SUBCOMMAND'
 }
 
 DESCRIPTIONS = {
@@ -374,7 +389,11 @@ to as taken by ssh (and so may be of the form username@host).  Make sure your
 SSH keys are in place.
 
 When connecting to JASMIN, your shell will be run as a login shell, which means
-loading, eg. ~/.bash_profile.  Bear this in mind when passing options such as
+loading, eg. ~/.bash_profile.  Bear in mind the effect this may have on
+executing bash (which may or may not source some configuration files, depending
+on the options given).
+
+when passing options such as
 those that depend on the working directory.
 
 Bash is required on the virtual machine.  If it cannot be executed as `bash',
@@ -456,6 +475,7 @@ CMD_FNS = {
 
 LOUD = ('start',)
 
+# entry point
 
 if __name__ == '__main__':
     # get subcommand
@@ -478,7 +498,7 @@ if __name__ == '__main__':
         else:
             # no arguments or unknown subcommand
             prog = op.get_prog_name()
-            op.error('expected a subcommand: try `{0} help\''.format(prog))
+            op.error('expected a subcommand: try `%s help\'' (prog,))
             ret = ERR_ARGS
     else:
         # got subcommand: parse options
@@ -504,15 +524,15 @@ if __name__ == '__main__':
         n_got = len(args)
         for i, arg in enumerate(expected_args):
             if n_got <= i:
-                op.error('{0}: expected {1} argument'.format(cmd, arg))
+                op.error('%s: expected %s argument' % (cmd, arg))
         var = cmd in VAR_ARGS
         n_expected = VAR_ARGS[cmd] if var else None
         var = var and n_expected is None
         if n_expected is None:
             n_expected = len(expected_args)
         if not var and n_got > n_expected:
-            msg = '{0}: got too many arguments (expected {1}, got {2})'
-            op.error(msg.format(cmd, n_expected, n_got))
+            msg = '%s: got too many arguments (expected %s, got %s)'
+            op.error(msg % (cmd, n_expected, n_got))
         # run subcommand
         f = CMD_FNS[cmd]
         if var:

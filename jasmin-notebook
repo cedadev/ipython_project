@@ -9,8 +9,6 @@ from subprocess import Popen, PIPE, STDOUT
 from pipes import quote as quote_single
 from webbrowser import open as open_url
 
-# test for bash and note that it's required
-# document error codes
 # option: script to run on login (local or remote)
 # option: commands to run on login
 # option: run notebook server locally and cluster remotely
@@ -119,11 +117,12 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
     cmds.append(['exec'] + ipython_cmd)
     cmds = [cmd if isinstance(cmd, basestring) else ' '.join(cmd) \
             for cmd in cmds]
+    cmds = ' && '.join(cmds)
     # construct ssh command
     # 'ssh <command>' runs '$SHELL -c <command>'
     ssh_opts = ['-t']
     ssh_opts.append('-L{0}:localhost:{1}'.format(local_port, remote_port))
-    ssh_cmd = ['ssh'] + ssh_opts + [host, ' && '.join(cmds)]
+    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c {0}'.format(quote(cmds))]
     # run command
     print_popen_cmd(ssh_cmd)
     try:
@@ -194,7 +193,7 @@ def getconf (host, component, profile, ipython):
     ssh_opts = []
     if not verbose:
         ssh_opts.append('-q')
-    ssh_cmd = ['ssh'] + ssh_opts + [host, cmds]
+    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c {0}'.format(quote(cmds))]
     # run command
     print_popen_cmd(ssh_cmd)
     try:
@@ -234,10 +233,11 @@ def setconf (host, component, profile, local_profile, local_file, no_clobber,
         cmds.append('set -o noclobber') # assuming Bash
     do, f = cmd_for_config_file(profile, component)
     cmds.append('{0} && tee > {1}'.format(do, f))
+    cmds = '\n'.join(cmds)
     ssh_opts = []
     if not verbose:
         ssh_opts.append('-q')
-    ssh_cmd = ['ssh'] + ssh_opts + [host, '\n'.join(cmds)]
+    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c {0}'.format(quote(cmds))]
     # run command
     print_popen_cmd(ssh_cmd)
     try:
@@ -377,6 +377,16 @@ When connecting to JASMIN, your shell will be run as a login shell, which means
 loading, eg. ~/.bash_profile.  Bear this in mind when passing options such as
 those that depend on the working directory.
 
+Bash is required on the virtual machine.  If it cannot be executed as `bash',
+the script terminates.
+
+The exit status in the case of an error is:\\n
+    1: couldn't execute a command\\n
+    2: incorrect arguments\\n
+    3: network error (couldn't connect)\\n
+    4: any other known error\\n
+    5: unknown error
+
 For help with a subcommand, pass `help SUBCOMMAND'.
 
 Subcommands:\\n
@@ -393,7 +403,11 @@ start with `-', make sure to pass `--' first.''',
 '''Print the contents of the IPython configuration file on the JASMIN virtual
 machine for COMPONENT, which is, for example, `ipython_notebook' or
 `ipcluster'.  (The file used is COMPONENT_config.py under the directory for the
-selected profile.)''',
+selected profile.)
+
+Because this command's output is printed, the verbose option only takes effect
+if passed twice.  If so, the output is, of course, not a valid IPython
+configuration file.''',
     'setconf':
 '''Transfer local IPython configuration files to the JASMIN virtual machine for
 COMPONENT, which is, for example, `ipython_notebook' or `ipcluster'.  If

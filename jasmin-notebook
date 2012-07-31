@@ -9,7 +9,7 @@ from subprocess import Popen, PIPE, STDOUT
 from pipes import quote as quote_single
 from webbrowser import open as open_url
 
-# test for bash
+# test for bash and note that it's required
 # document error codes
 # option: script to run on login (local or remote)
 # option: commands to run on login
@@ -176,13 +176,26 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
     info('return code:', ret)
     return translate_ret(ret)
 
+def cmd_for_config_file (profile, component):
+    """Return escaped commands for accessing a configuration file.
+
+Returns a tuple of commands; the first must be executed directly, after which
+the second is safe to use as an expression that gives the file path.
+
+"""
+    return ('d="$(ipython locate profile {0})"'.format(quote(profile)),
+            '"$d"/{0}_config.py'.format(quote(component)))
+
 def getconf (host, component, profile, ipython):
     """Get an IPython configuration file from the VM."""
-    cmds = 'd="$(ipython locate profile {0})" && cat "$d"/{1}_config.py'
-    cmds = cmds.format(quote(profile), quote(component))
-    ssh_cmd = ['ssh', host, cmds]
+    # construct command
+    do, f = cmd_for_config_file(profile, component)
+    cmds = '{0} && cat {1}'.format(do, f)
+    ssh_opts = []
     if not verbose:
-        ssh_cmd.insert(1, '-q')
+        ssh_opts.append('-q')
+    ssh_cmd = ['ssh'] + ssh_opts + [host, cmds]
+    # run command
     print_popen_cmd(ssh_cmd)
     try:
         process = Popen(ssh_cmd)
@@ -198,8 +211,53 @@ def getconf (host, component, profile, ipython):
 def setconf (host, component, profile, local_profile, local_file, no_clobber,
              ipython):
     """Upload an IPython configuration file to the VM."""
-    error('setconf: subcommand not implemented', ERR_ARGS)#host, component, profile, local_profile, local_file, no_clobber, ipython
-    return 0
+    # find local file
+    if local_file is None:
+        if local_profile is None:
+            local_profile = profile
+        # try known dirs
+        home = os.path.expanduser('~')
+        profile_dir = 'profile_' + local_profile
+        file_name = component + '_config.py'
+        for d in (('.ipython',), ('.config', 'ipython')):
+            f = join_path(*((home,) + d + (profile_dir, file_name)))
+            if os.path.isfile(f):
+                local_file = f
+                break
+        if local_file is None:
+            # didn't find anything
+            msg = 'couldn\'t find {0} under profile {1}'
+            error(msg.format(file_name, local_profile), ERR_OTHER)
+    # construct command
+    cmds = []
+    if no_clobber:
+        cmds.append('set -o noclobber') # assuming Bash
+    do, f = cmd_for_config_file(profile, component)
+    cmds.append('{0} && tee > {1}'.format(do, f))
+    ssh_opts = []
+    if not verbose:
+        ssh_opts.append('-q')
+    ssh_cmd = ['ssh'] + ssh_opts + [host, '\n'.join(cmds)]
+    # run command
+    print_popen_cmd(ssh_cmd)
+    try:
+        process = Popen(ssh_cmd, stdin = PIPE)
+    except OSError:
+        error('couldn\'t run ssh', ERR_EXEC)
+    # pass config file on stdin
+    # TODO: handle read errors
+    try:
+        with open(local_file, 'r') as f:
+            data = f.read()
+    except (IOError, OSError):
+        error('couldn\'t read file \'{0}\''.format(local_file), ERR_OTHER)
+    process.communicate(data)
+    ret = process.returncode
+    if not verbose and ret == 255:
+        # ssh error
+        error('ssh: couldn\'t log in to the given host', ERR_NET)
+    info('return code:', ret)
+    return translate_ret(ret)
 
 def help_cmd (cmd = None):
     """Print help on a subcommand."""
@@ -296,7 +354,8 @@ def mk_op (cmd):
 ERR_EXEC = 1
 ERR_ARGS = 2 # optparse uses this
 ERR_NET = 3
-ERR_UNKNOWN = 4
+ERR_OTHER = 4
+ERR_UNKNOWN = 5
 
 COMMANDS = ('start', 'getconf', 'setconf', 'help')
 

@@ -1,0 +1,343 @@
+#! /usr/bin/env python
+
+import sys
+from signal import signal, SIGINT, SIGTERM
+import os
+from os.path import join as join_path
+import optparse
+from subprocess import Popen, PIPE, STDOUT
+from pipes import quote as quote_single
+from webbrowser import open as open_url
+
+# update desc for other subcommands
+# view/set ipython configuration files on JASMIN
+#   don't overwrite config files on upload
+#       option: save dated backups or just overwrite
+#   check (remote) ipython environment variables for path, or take as option
+#   particularly to allow configuration of ipython-cluster to utilise the right number of nodes
+#       can have a default number of engines in notebook cluster tab?
+# option: script to run on login
+# option: commands to run on login
+# option: run notebook server locally and cluster remotely
+# why are the '\r's needed?
+
+
+class Formatter (optparse.IndentedHelpFormatter):
+    """optparse text formatter to handle multiple description paragraphs."""
+
+    def format_description (self, description):
+        return '\n'.join(
+            optparse.IndentedHelpFormatter.format_description(self, paragraph)
+            for paragraph in description.split('\n\n')
+        )
+
+
+ERR_EXEC = 1
+ERR_ARGS = 2 # optparse uses this
+ERR_NET = 3
+ERR_UNKNOWN = 4
+
+COMMANDS = ('start', 'getconf', 'setconf')
+
+DEFAULTS = {
+    'global': {
+        'verbose': False
+    }, 'start': {
+        'local_port': 8888,
+        'remote_port': 8888,
+        'ipython': 'ipython',
+        'browser': False
+    }, 'getconf': {
+        'profile': 'default'
+    }, 'setconf': {
+    }
+}
+
+desc = '''This script starts an IPython notebook server on the JASMIN virtual
+machine found at HOST (which may be of the form username@host).  The web
+interface is forwarded over an SSH connection to a local port.  Make sure your
+SSH keys are in place.
+
+IPYTHON_OPTS are any number of extra arguments to pass to the ipython command.
+This should not include the --port option.  If any start with `-', make sure to
+pass `--' first.
+
+Before starting the notebook on JASMIN, your shell will be run as a login
+shell, which means loading, eg. ~/.bash_profile.  Bear this in mind  when
+passing the --directory and --ipython options.'''
+
+def finish (sig, process):
+    """Signal handler."""
+    process.send_signal(sig)
+
+def printer_head (category):
+    if loud:
+        return '[{0}]'.format(category.upper())
+    else:
+        return '{0}:'.format(category.lower())
+
+def error (msg, code, process = None):
+    """Print an error message and exit."""
+    print >> sys.stderr, printer_head('error'), msg
+    if process is not None:
+        finish(SIGTERM, process)
+        process.wait()
+    sys.exit(code)
+
+def mk_printer (category, dest = sys.stdout, need_verbose = False):
+    """Create and return a function that prints messages."""
+    def printer (*msgs):
+        if need_verbose and not verbose:
+            return
+        print >> dest, printer_head(category),
+        for msg in msgs[:-1]:
+            print >> dest, msg,
+        print >> dest, msgs[-1]
+    return printer
+
+info = mk_printer('info', need_verbose = True)
+warn = mk_printer('warning', sys.stderr)
+
+def quote (args):
+    """pipes.quote wrapper to handle lists of args and empty args."""
+    if isinstance(args, basestring):
+        return quote_single(args) if args else '""'
+    else:
+        return [quote_single(s) if s else '""' for s in args]
+
+def print_popen_cmd (cmd):
+    """Print a list of commands as taken by subprocess.Popen.
+
+The output can be safely run in a shell.
+
+"""
+    escaped_cmd = ' '.join(quote(arg) for arg in cmd)
+    info('running command:', '[[[ {0} ]]]'.format(escaped_cmd))
+
+def check_ssh ():
+    """Check local SSH environment for problems."""
+    ## check for ssh-agent
+    #no_agent = False
+    ## check for environment variable
+    #try:
+        #pid = os.environ['SSH_AGENT_PID']
+    #except KeyError:
+        #no_agent = True
+    #else:
+        ## check the process with this PID is ssh-agent and is still running
+        #p = Popen(('ps', '-p', pid, '-o', 'comm='), stdout = PIPE,
+                    #stderr = STDOUT)
+        #name = p.communicate()[0]
+        #if p.returncode != 0 or name != 'ssh-agent':
+            #no_agent = True
+    #if no_agent:
+        #warn('ssh-agent doesn\'t appear to be running')
+
+    # check for ssh-agent: let ssh-add do the work
+    try:
+        p = Popen(('ssh-add', '-l'), stdout = PIPE, stderr = STDOUT)
+    except OSError:
+        warn('couldn\'t run ssh-add')
+    else:
+        out = p.communicate()[0]
+        rtn = p.returncode
+        if rtn == 1:
+            warn('ssh-agent doesn\'t appear to have any keys')
+        elif rtn == 2:
+            warn('ssh-agent doesn\'t appear to be running')
+
+def start (host, ipython_args, local_port, remote_port, directory, ipython,
+           browser):
+    """Start the IPython notebook on the VM."""
+    check_ssh()
+    # construct ipython command
+    ipython_cmd = [quote(ipython), 'notebook', '--no-browser']
+    ipython_cmd.append('--port={0}'.format(remote_port))
+    ipython_cmd += quote(ipython_args)
+    # construct shell commands - make sure to quote input
+    if directory is not None:
+        cmds = [('cd', quote(directory))]
+        if verbose:
+            cmds.append('echo [INFO] now in \\"`pwd`\\"')
+    else:
+        cmds = []
+    cmds.append(['exec'] + ipython_cmd)
+    cmds = [cmd if isinstance(cmd, basestring) else ' '.join(cmd) \
+            for cmd in cmds]
+    # construct ssh command
+    # 'ssh <command>' runs '$SHELL -c <command>'
+    ssh_opts = ['-t']
+    ssh_opts.append('-L{0}:localhost:{1}'.format(local_port, remote_port))
+    ssh_cmd = ['ssh'] + ssh_opts + [host, ' && '.join(cmds)]
+    # run command
+    print_popen_cmd(ssh_cmd)
+    try:
+        process = Popen(ssh_cmd, stdout = PIPE, stderr = STDOUT)
+    except OSError:
+        error('couldn\'t run ssh', ERR_EXEC)
+    # set up signal handlers
+    signal(SIGINT, lambda sig, frame: finish(sig, process))
+    signal(SIGTERM, lambda sig, frame: finish(sig, process))
+    # look through stdout for a specific printed line
+    search_line = '[NotebookApp] The IPython Notebook is running at:'
+    err_line = 'channel_setup_fwd_listener: cannot listen to port:'
+    success = False
+    while True:
+        s = process.stdout.readline()
+        if len(s) == 0:
+            # something went wrong
+            break
+        if s.startswith(search_line):
+            if str(remote_port) + '/' not in s:
+                # printed port isn't the one we wanted
+                error('couldn\'t set up port forwarding: remote port ({0}) ' \
+                      'is in use\r'.format(remote_port), ERR_NET, process)
+            else:
+                # replace remote with local port
+                sys.stdout.write(s.replace(str(remote_port), str(local_port)))
+                success = True
+                break
+        # write line back out
+        sys.stdout.write(s)
+        if s.startswith(err_line):
+            # ssh error
+            error('couldn\'t set up port forwarding: local port ({0}) is ' \
+                  'in use\r'.format(local_port), ERR_NET, process)
+    # open in browser
+    if success and browser:
+        url = 'http://127.0.0.1:{0}/'.format(local_port)
+        info('opening browser to {0}\r'.format(url))
+        open_url(url)
+    # no way to switch output back to stdout, so we need to relay everything
+    while True:
+        # read one character at a time so that input is echoed immediately
+        c = process.stdout.read(1)
+        if len(c) == 0:
+            # process has finished
+            break
+        sys.stdout.write(c)
+        sys.stdout.flush()
+    ret = process.wait()
+    info('return code:', ret)
+    return translate_ret(ret)
+
+def getconf (host, component, profile, ipython):
+    """Get an IPython configuration file from the VM."""
+    cmds = 'd="$(ipython locate profile {0})" && cat "$d"/{1}_config.py'
+    cmds = cmds.format(quote(profile), quote(component))
+    ssh_cmd = ('ssh', '-q', host, cmds)
+    print_popen_cmd(ssh_cmd)
+    try:
+        process = Popen(ssh_cmd)
+    except OSError:
+        error('couldn\'t run ssh', ERR_EXEC)
+    ret = process.wait()
+    info('return code:', ret)
+    return translate_ret(ret)
+
+def translate_ret (ret):
+    """Turn some known error codes into ERR_*."""
+    if ret == 0:
+        return 0
+    elif ret == 127: # shell: command not found
+        return ERR_EXEC
+    else:
+        return ERR_UNKNOWN
+
+if __name__ == '__main__':
+    # TODO:
+    # - create global op and parse for help/version/errors and subcommand
+    # - create op for subcommand and go as normal
+    # get command
+    if len(sys.argv) == 1 or sys.argv[1] not in COMMANDS:
+        cmd = None
+    else:
+        cmd = sys.argv[1]
+    # create option parser for the one command if we have one, else all of them
+    cmds = COMMANDS if cmd is None else (cmd,)
+    # usage has one line per command
+    usage_strings = (
+        '%prog {0} [OPTIONS] [--] HOST [IPYTHON_OPTS...]',
+        '%prog {0} [OPTIONS] HOST COMPONENT',
+        '%prog {0} [OPTIONS] HOST'
+    )
+    usage = [usage_string.format(c) \
+             for usage_string, c in zip(usage_strings, cmds)]
+    for i in xrange(1, len(usage)):
+        usage[i] = ' ' * len('Usage: ') + usage[i]
+    usage = '\n'.join(usage)
+    op = optparse.OptionParser(usage = usage, version = '%prog 0.1.0',
+                               description = desc, formatter = Formatter())
+    # global options
+    op.add_option('-i', '--ipython', action = 'store', type = 'string',
+                  help = 'path to ipython executable (default: %default)')
+    op.add_option('-v', '--verbose', action = 'count',
+                  help = 'print more information')
+    # create and add option groups
+    # TODO: group descriptions
+    groups = []
+    if 'start' in cmds:
+        # start
+        g = optparse.OptionGroup(op, 'start')
+        groups.append(g)
+        g.add_option('-l', '--local-port', action = 'store', type = 'int',
+                     help = 'local port to forward the connection to ' \
+                            '(default: %default)')
+        g.add_option('-r', '--remote-port', action = 'store', type = 'int',
+                     help = 'port on the remote machine to run the notebook ' \
+                            'on (default: %default)')
+        g.add_option('-d', '--directory', action = 'store', type = 'string',
+                     help = 'directory to run the notebook server in ' \
+                            '(default: initial directory)')
+        g.add_option('-b', '--browser', action = 'store_true',
+                     help = 'open the web interface in a web browser')
+    if 'getconf' in cmds:
+        # getconf
+        g = optparse.OptionGroup(op, 'getconf')
+        groups.append(g)
+        g.add_option('-p', '--profile', action = 'store', type = 'string',
+                     help = 'IPython configuration profile to use (default: ' \
+                            '%default)')
+    if 'setconf' in cmds:
+        # setconf
+        g = optparse.OptionGroup(op, 'setconf')
+        groups.append(g)
+    for g in groups:
+        op.add_option_group(g)
+    # if we don't have a command, print help or error message
+    if cmd is None:
+        # parse first, in case we got a help or version option
+        op.parse_args()
+        # otherwise, show an error
+        # FIXME: catches unknown options and exits - would rather override that
+        prog = op.get_prog_name()
+        op.error('expected a subcommand: try `{0} -h\''.format(prog))
+        sys.exit(ERR_ARGS)
+    # else parse options
+    defaults = dict(DEFAULTS['global'])
+    defaults.update(DEFAULTS[cmd])
+    op.set_defaults(**defaults)
+    options, args = op.parse_args(sys.argv[2:])
+    # handle verbose
+    global loud
+    loud = {'start': True, 'getconf': False, 'setconf': False}[cmd]
+    global verbose
+    verbose = options.verbose
+    if verbose == 1 and cmd == 'getconf':
+        verbose = 0
+    info('received options:', options)
+    info('received arguments:', args)
+    del options.verbose
+    # run command
+    if len(args) < 1:
+        op.error('{0}: expected HOST argument'.format(cmd))
+    if cmd == 'start':
+        ret = start(args[0], args[1:], **options.__dict__)
+    elif cmd == 'getconf':
+        if len(args) < 2:
+            op.error('getconf: expected COMPONENT argument')
+        if len(args) > 2:
+            msg = 'getconf: got too many arguments (expected 2, got {0})'
+            op.error(msg.format(len(args)))
+        ret = getconf(*args, **options.__dict__)
+    sys.exit(ret)

@@ -12,11 +12,8 @@ from pipes import quote as quote_single
 from webbrowser import open as open_url
 
 # TODO:
-# - subcommand to list ipython config files for a profile
-# - subcommand to create ipython profile (ipython profile create [--parallel])
+# - getconf option: write to local file
 # - version check/error against sys.version_info
-# - option: script to run on login (local or remote)
-# - option: commands to run on login
 # - option: run notebook server locally and cluster remotely
 # - why are the '\r's needed?
 
@@ -61,7 +58,7 @@ def error (msg, code, process = None):
         process.wait()
     exit(code)
 
-def mk_printer (category, dest = stdout, need_verbose = False):
+def mk_printer (category, dest = stderr, need_verbose = False):
     """Create and return a function that prints messages."""
     def printer (*msgs):
         if need_verbose and not verbose:
@@ -73,7 +70,7 @@ def mk_printer (category, dest = stdout, need_verbose = False):
     return printer
 
 info = mk_printer('info', need_verbose = True)
-warn = mk_printer('warning', stderr)
+warn = mk_printer('warning')
 
 def quote (args):
     """pipes.quote wrapper to handle lists of args and empty args."""
@@ -198,15 +195,48 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
     info('return code:', ret)
     return translate_ret(ret)
 
-def cmd_for_config_file (profile, component):
+def cmd_for_config_file (profile, component = None):
     """Return escaped commands for accessing a configuration file.
 
 Returns a tuple of commands; the first must be executed directly, after which
 the second is safe to use as an expression that gives the file path.
 
 """
-    return ('d="$(ipython locate profile %s)"' % (quote(profile),),
-            '"$d"/%s_config.py' % (quote(component),))
+    do = 'd="$(ipython locate profile %s)"' % (quote(profile),)
+    if component is None:
+        return do
+    else:
+        return (do, '"$d"/%s_config.py' % (quote(component),))
+
+def listconf (host, profile, ipython, print_zero, bash_conf, login):
+    """List IPython configuration files on the VM."""
+    check_ssh()
+    # construct command
+    # can't just use ls/grep because their outputs might be customised
+    # and to use python over ipython we'd have to ask where it is
+    cmds = [cmd_for_config_file(profile),
+            '''echo -n "$d" | ipython --quick -c "import os
+import sys
+try:
+    fs = os.listdir(sys.stdin.read())
+except (IOError, OSError):
+    fs = []
+fs = [f[:-len('_config.py')] for f in fs if f.endswith('_config.py')]
+print '%s'.join(fs)"''' % (('\\0' if print_zero else '\\n'),)]
+    ssh_cmd = mk_ssh_cmd(host, cmds, bash_conf, login,
+                         [] if verbose else ['-q'])
+    # run command
+    print_popen_cmd(ssh_cmd)
+    try:
+        process = Popen(ssh_cmd)
+    except OSError:
+        error('couldn\'t run ssh', ERR_EXEC)
+    ret = process.wait()
+    if not verbose and ret == 255:
+        # ssh error
+        error('ssh: couldn\'t log in to the given host', ERR_NET)
+    info('return code:', ret)
+    return translate_ret(ret)
 
 def getconf (host, component, profile, ipython, bash_conf, login):
     """Get an IPython configuration file from the VM."""
@@ -279,12 +309,36 @@ def setconf (host, component, profile, local_profile, local_file, no_clobber,
     info('return code:', ret)
     return translate_ret(ret)
 
+def createconf (host, profile, reset, no_parallel, ipython, bash_conf, login):
+    """Create IPython configuration files on the VM."""
+    check_ssh()
+    # construct command
+    cmd = ['ipython profile create', quote(profile)]
+    if reset:
+        cmd.append('--reset')
+    if not no_parallel:
+        cmd.append('--parallel')
+    ssh_cmd = mk_ssh_cmd(host, (' '.join(cmd),), bash_conf, login,
+                         [] if verbose else ['-q'])
+    # run command
+    print_popen_cmd(ssh_cmd)
+    try:
+        process = Popen(ssh_cmd)
+    except OSError:
+        error('couldn\'t run ssh', ERR_EXEC)
+    ret = process.wait()
+    if not verbose and ret == 255:
+        # ssh error
+        error('ssh: couldn\'t log in to the given host', ERR_NET)
+    info('return code:', ret)
+    return translate_ret(ret)
+
 def help_cmd (cmd = None):
     """Print help on a subcommand."""
     if cmd is None:
-        op = mk_op_basic(*COMMANDS)
-    elif cmd not in COMMANDS:
-        op = mk_op_basic(*COMMANDS)
+        op = mk_op_basic(*SUBCOMMANDS)
+    elif cmd not in SUBCOMMANDS:
+        op = mk_op_basic(*SUBCOMMANDS)
         op.error('help: invalid command: \'%s\'' % (cmd,))
     else:
         op = mk_op(cmd)
@@ -315,6 +369,16 @@ def mk_op_basic (*cmds):
     desc = DESCRIPTIONS[cmds[0]] if len(cmds) == 1 else DESCRIPTIONS[None]
     op = optparse.OptionParser(usage = usage, add_help_option = False,
                                description = desc, formatter = Formatter())
+    # set defaults: start with global defaults
+    defaults = dict(DEFAULTS[None])
+    # get defaults for every group involved
+    for cmd in cmds:
+        for g in GROUPS[cmd]:
+            defaults.update(DEFAULTS[g])
+        defaults.update(DEFAULTS[cmd])
+    # and then those for subcommand-specific options
+    for cmd in cmds:
+        op.set_defaults(**defaults)
     return op
 
 def mk_op (cmd):
@@ -322,17 +386,18 @@ def mk_op (cmd):
     op = mk_op_basic(cmd)
     groups = GROUPS[cmd]
     # create and add options
-    # options to use more than once
+    # options to use more than once (automated adding of these would be nice,
+    # but order is important)
     O = optparse.Option
-    if 'global' in groups:
-        o_verbose = O('-v', '--verbose', action = 'count',
-                      help = 'print more information')
+    o_verbose = O('-v', '--verbose', action = 'store_true',
+                  help = 'print more information')
     if 'remote' in groups:
         o_ipython = O('-i', '--ipython', action = 'store', type = 'string',
                       help = 'path to ipython executable (default: %default)')
         o_bash_conf = O('-c', '--bash-conf', action = 'store_true',
                         help = 'when running bash on the virtual machine, ' \
-                               'source its configuration files')
+                               'source its configuration files (not done by ' \
+                               'default)')
         o_login = O('-g', '--login', action = 'store_true',
                     help = 'run bash on the virtual machine as a login ' \
                            'shell; this causes different files to be sourced')
@@ -355,20 +420,34 @@ def mk_op (cmd):
         op.add_option('-b', '--browser', action = 'store_true',
                       help = 'open the web interface in a web browser')
         op.add_options((o_bash_conf, o_login, o_verbose))
+    elif cmd == 'listconf':
+        op.add_options((o_profile, o_ipython))
+        op.add_option('-z', '--print-zero', action = 'store_true',
+                      help = 'separate listed files by null bytes instead ' \
+                             'of newlines')
+        op.add_options((o_bash_conf, o_login, o_verbose))
     elif cmd == 'getconf':
-        op.add_options((o_profile, o_ipython, o_bash_conf, o_login,
-                        o_verbose))
+        op.add_options((o_profile, o_ipython, o_bash_conf, o_login, o_verbose))
     elif cmd == 'setconf':
         op.add_option(o_profile)
         op.add_option('-l', '--local-profile', action = 'store',
                       type = 'string',
-                      help = 'IPython configuration profile to use for the ' \
-                             'local file (defaults to PROFILE)')
+                      help = 'local IPython configuration profile to look ' \
+                             'in for the file to transfer; ignored if ' \
+                             '--local-file is given (defaults to PROFILE)')
         op.add_option('-f', '--local-file', action = 'store', type = 'string',
                       help = 'full path to the local version of the ' \
                              'configuration file to transfer')
         op.add_option('-n', '--no-clobber', action = 'store_true',
                       help = 'don\'t overwrite the remote file if it exists')
+        op.add_options((o_ipython, o_bash_conf, o_login, o_verbose))
+    elif cmd == 'createconf':
+        op.add_option(o_profile)
+        op.add_option('-r', '--reset', action = 'store_true',
+                      help = 'overwrite existing configuration files')
+        op.add_option('-n', '--no-parallel', action = 'store_true',
+                      help = 'don\'t create configuration files for ' \
+                             'parallel computing components of IPython')
         op.add_options((o_ipython, o_bash_conf, o_login, o_verbose))
     else: # cmd == 'help'
         op.add_option(o_verbose)
@@ -385,14 +464,20 @@ ERR_NET = 3
 ERR_OTHER = 4
 ERR_UNKNOWN = 5
 
-COMMANDS = ('start', 'getconf', 'setconf', 'help')
+SUBCOMMANDS = ('start', 'listconf', 'getconf', 'setconf', 'createconf', 'help')
 
 USAGES = {
     'start': '%prog start [OPTIONS] [--] HOST [IPYTHON_OPTS...]',
+    'listconf': '%prog listconf [OPTIONS] HOST',
     'getconf': '%prog getconf [OPTIONS] HOST COMPONENT',
     'setconf': '%prog setconf [OPTIONS] HOST COMPONENT',
+    'createconf': '%prog createconf [OPTIONS] HOST',
     'help': '%prog help SUBCOMMAND'
 }
+
+component_desc = '''COMPONENT, which is, for example, `ipython_notebook' or
+`ipcluster'.  (The file used is COMPONENT_config.py under the directory for the
+selected profile.)'''
 
 DESCRIPTIONS = {
     None:
@@ -419,40 +504,47 @@ The exit status in the case of an error is:\\n
     4: any other known error\\n
     5: unknown error
 
-For help with a subcommand, pass `help SUBCOMMAND'.
-
-Subcommands:\\n
-    start: start the notebook server.\\n
-    getconf: get an IPython configuration file.\\n
-    setconf: upload an IPython configuration file.\\n
-    help: show this help or the help for another subcommand.''',
+For help with a subcommand, pass `help SUBCOMMAND'.''',
     'start':
-'''Start the notebook server and forwards the web interface over an SSH
+'''Start the notebook server and forward the web interface over an SSH
 connection to a local port.  IPYTHON_OPTS are any number of extra arguments to
 pass to the ipython command, but should not include the --port option.  If any
 start with `-', make sure to pass `--' first.''',
+    'listconf':
+'''List IPython configuration files present on the JASMIN virtual machine.
+These are in the form of %s''' % component_desc,
     'getconf':
 '''Print the contents of the IPython configuration file on the JASMIN virtual
-machine for COMPONENT, which is, for example, `ipython_notebook' or
-`ipcluster'.  (The file used is COMPONENT_config.py under the directory for the
-selected profile.)
+machine for %s
 
-Because this command's output is printed, the verbose option only takes effect
-if passed twice.  If so, the output is, of course, not a valid IPython
-configuration file.''',
+Any extra output caused by the verbose option should be sent to stderr, but
+this is not guaranteed, and in this case the output may not be a valid IPython
+configuration file.''' % component_desc,
     'setconf':
 '''Transfer local IPython configuration files to the JASMIN virtual machine for
-COMPONENT, which is, for example, `ipython_notebook' or `ipcluster'.  If
---local-file is not passed, the default location is used, for the given
---local-profile.''',
+%s''' % component_desc,
+    'createconf':
+'''Create a default set of IPython configuration files on the JASMIN virtual
+machine.''',
     'help':
 '''Get help on subcommand SUBCOMMAND.'''
 }
 
+SHORT_DESCS = ( # order is important
+    ('start', 'start the notebook server'),
+    ('listconf', 'list IPython configuration files'),
+    ('getconf', 'get an IPython configuration file'),
+    ('setconf', 'upload an IPython configuration file'),
+    ('createconf', 'create default IPython configuration files'),
+    ('help', 'show this help or the help for another subcommand')
+)
+
 ARGS = {
     'start': ('HOST',),
+    'listconf': ('HOST',),
     'getconf': ('HOST', 'COMPONENT'),
     'setconf': ('HOST', 'COMPONENT'),
+    'createconf': ('HOST',),
     'help': ()
 }
 
@@ -462,14 +554,16 @@ VAR_ARGS = {
 }
 
 GROUPS = {
-    'start': ('global', 'remote'),
-    'getconf': ('global', 'remote', 'conf'),
-    'setconf': ('global', 'remote', 'conf'),
-    'help': ('global',)
+    'start': ('remote',),
+    'listconf': ('remote', 'conf'),
+    'getconf': ('remote', 'conf'),
+    'setconf': ('remote', 'conf'),
+    'createconf': ('remote', 'conf'),
+    'help': ()
 }
 
 DEFAULTS = {
-    'global': {
+    None: {
         'verbose': False,
     }, 'remote': {
         'ipython': 'ipython',
@@ -481,21 +575,32 @@ DEFAULTS = {
         'local_port': 8888,
         'remote_port': 8888,
         'browser': False
+    }, 'listconf': {
+        'print_zero': False,
     }, 'getconf': {
     }, 'setconf': {
         'no_clobber': False
+    }, 'createconf': {
+        'reset': False,
+        'no_parallel': False
     }, 'help': {
     }
 }
 
 CMD_FNS = {
     'start': start,
+    'listconf': listconf,
     'getconf': getconf,
     'setconf': setconf,
+    'createconf': createconf,
     'help': help_cmd
 }
 
 LOUD = ('start',)
+
+# add summaries to main help
+descs = ['%s: %s.' % (name, desc) for name, desc in SHORT_DESCS]
+DESCRIPTIONS[None] += '\n\n' + '\\n\n    '.join(['Subcommands:'] + descs)
 
 # entry point
 
@@ -505,12 +610,12 @@ if __name__ == '__main__':
         cmd = argv[1]
     else:
         cmd = None
-    if cmd not in COMMANDS:
+    if cmd not in SUBCOMMANDS:
         # no subcommand: print help or error message
         if len(argv) > 2:
             # got other arguments
             cmd = False
-        op = mk_op_basic(*COMMANDS)
+        op = mk_op_basic(*SUBCOMMANDS)
         if cmd is None or cmd in ('-h', '--help'):
             op.print_help()
             ret = 0
@@ -526,20 +631,12 @@ if __name__ == '__main__':
         # got subcommand: parse options
         cmd = argv[1]
         op = mk_op(cmd)
-        defaults = {}
-        for g in GROUPS[cmd]:
-            defaults.update(DEFAULTS[g])
-        defaults.update(DEFAULTS[cmd])
-        op.set_defaults(**defaults)
         options, args = op.parse_args(argv[2:])
         # handle verbose
         global loud
         loud = cmd in LOUD
         global verbose
         verbose = options.verbose
-        if verbose == 1 and cmd == 'getconf':
-            verbose = 0
-        verbose = verbose > 0
         info('received options:', options)
         info('received arguments:', args)
         del options.verbose

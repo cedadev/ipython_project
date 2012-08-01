@@ -12,11 +12,8 @@ from pipes import quote as quote_single
 from webbrowser import open as open_url
 
 # TODO:
-# - option: run bash as a login shell
-# - option: don't load bash configs
 # - subcommand to list ipython config files for a profile
 # - subcommand to create ipython profile (ipython profile create [--parallel])
-# - getconf - print to stdout, redirect ssh stuff to stderr
 # - version check/error against sys.version_info
 # - option: script to run on login (local or remote)
 # - option: commands to run on login
@@ -96,6 +93,22 @@ The output can be safely run in a shell.
 
 # subcommands
 
+def mk_ssh_cmd (host, cmds, bash_conf, login, ssh_opts = []):
+    """Construct a command list for the ssh connection."""
+    # order of options is important
+    bash_cmd = ['bash']
+    if login:
+        if not bash_conf:
+            bash_cmd.append('--noprofile')
+        bash_cmd.append('-l')
+    elif bash_conf:
+        # kind of weird, but the interactive option enables config file loading
+        # and doesn't really make the shell interactive
+        bash_cmd.append('-i')
+    bash_cmd.append('-c')
+    bash_cmd.append(quote(' && '.join(cmds)))
+    return ['ssh'] + ssh_opts + [host, ' '.join(bash_cmd)]
+
 def check_ssh ():
     """Check local SSH environment for problems."""
     # check for ssh-agent: let ssh-add do the work
@@ -113,7 +126,7 @@ def check_ssh ():
 
 
 def start (host, ipython_args, local_port, remote_port, directory, ipython,
-           browser):
+           browser, bash_conf, login):
     """Start the IPython notebook on the VM."""
     check_ssh()
     # construct ipython command
@@ -130,12 +143,9 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
     cmds.append(['exec'] + ipython_cmd)
     cmds = [cmd if isinstance(cmd, basestring) else ' '.join(cmd) \
             for cmd in cmds]
-    cmds = ' && '.join(cmds)
     # construct ssh command
-    # 'ssh <command>' runs '$SHELL -c <command>'
-    ssh_opts = ['-t']
-    ssh_opts.append('-L%s:localhost:%s' % (local_port, remote_port))
-    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c %s' % (quote(cmds),)]
+    ssh_opts = ['-t', '-L%s:localhost:%s' % (local_port, remote_port)]
+    ssh_cmd = mk_ssh_cmd(host, cmds, bash_conf, login, ssh_opts)
     # run command
     print_popen_cmd(ssh_cmd)
     try:
@@ -198,16 +208,14 @@ the second is safe to use as an expression that gives the file path.
     return ('d="$(ipython locate profile %s)"' % (quote(profile),),
             '"$d"/%s_config.py' % (quote(component),))
 
-def getconf (host, component, profile, ipython):
+def getconf (host, component, profile, ipython, bash_conf, login):
     """Get an IPython configuration file from the VM."""
     check_ssh()
     # construct command
     do, f = cmd_for_config_file(profile, component)
-    cmds = '%s && cat %s' % (do, f)
-    ssh_opts = []
-    if not verbose:
-        ssh_opts.append('-q')
-    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c %s' % (quote(cmds),)]
+    cmds = (do, 'cat %s' % (f,))
+    ssh_cmd = mk_ssh_cmd(host, cmds, bash_conf, login,
+                         [] if verbose else ['-q'])
     # run command
     print_popen_cmd(ssh_cmd)
     try:
@@ -222,7 +230,7 @@ def getconf (host, component, profile, ipython):
     return translate_ret(ret)
 
 def setconf (host, component, profile, local_profile, local_file, no_clobber,
-             ipython):
+             ipython, bash_conf, login):
     """Upload an IPython configuration file to the VM."""
     check_ssh()
     # find local file
@@ -247,12 +255,10 @@ def setconf (host, component, profile, local_profile, local_file, no_clobber,
     if no_clobber:
         cmds.append('set -o noclobber') # assuming Bash
     do, f = cmd_for_config_file(profile, component)
-    cmds.append('%s && tee > %s' % (do, f))
-    cmds = '\n'.join(cmds)
-    ssh_opts = []
-    if not verbose:
-        ssh_opts.append('-q')
-    ssh_cmd = ['ssh'] + ssh_opts + [host, 'bash -c %s' % (quote(cmds),)]
+    cmds.append(do)
+    cmds.append('tee > %s' % (f,))
+    ssh_cmd = mk_ssh_cmd(host, cmds, bash_conf, login,
+                         [] if verbose else ['-q'])
     # run command
     print_popen_cmd(ssh_cmd)
     try:
@@ -314,14 +320,23 @@ def mk_op_basic (*cmds):
 def mk_op (cmd):
     """Make an optparse.OptionParser for the given subcommand."""
     op = mk_op_basic(cmd)
+    groups = GROUPS[cmd]
     # create and add options
-    if cmd is not None:
-        # options to use more than once
-        O = optparse.Option
-        o_ipython = O('-i', '--ipython', action = 'store', type = 'string',
-                      help = 'path to ipython executable (default: %default)')
+    # options to use more than once
+    O = optparse.Option
+    if 'global' in groups:
         o_verbose = O('-v', '--verbose', action = 'count',
                       help = 'print more information')
+    if 'remote' in groups:
+        o_ipython = O('-i', '--ipython', action = 'store', type = 'string',
+                      help = 'path to ipython executable (default: %default)')
+        o_bash_conf = O('-c', '--bash-conf', action = 'store_true',
+                        help = 'when running bash on the virtual machine, ' \
+                               'source its configuration files')
+        o_login = O('-g', '--login', action = 'store_true',
+                    help = 'run bash on the virtual machine as a login ' \
+                           'shell; this causes different files to be sourced')
+    if 'conf' in groups:
         o_profile = O('-p', '--profile', action = 'store', type = 'string',
                       help = 'IPython configuration profile on remote ' \
                              'machine to use (default: %default)')
@@ -339,24 +354,22 @@ def mk_op (cmd):
         op.add_option(o_ipython)
         op.add_option('-b', '--browser', action = 'store_true',
                       help = 'open the web interface in a web browser')
-        op.add_option(o_verbose)
+        op.add_options((o_bash_conf, o_login, o_verbose))
     elif cmd == 'getconf':
-        op.add_option(o_profile)
-        op.add_option(o_ipython)
-        op.add_option(o_verbose)
+        op.add_options((o_profile, o_ipython, o_bash_conf, o_login,
+                        o_verbose))
     elif cmd == 'setconf':
         op.add_option(o_profile)
         op.add_option('-l', '--local-profile', action = 'store',
                       type = 'string',
                       help = 'IPython configuration profile to use for the ' \
-                             'local file (default: %default)')
+                             'local file (defaults to PROFILE)')
         op.add_option('-f', '--local-file', action = 'store', type = 'string',
                       help = 'full path to the local version of the ' \
                              'configuration file to transfer')
         op.add_option('-n', '--no-clobber', action = 'store_true',
                       help = 'don\'t overwrite the remote file if it exists')
-        op.add_option(o_ipython)
-        op.add_option(o_verbose)
+        op.add_options((o_ipython, o_bash_conf, o_login, o_verbose))
     else: # cmd == 'help'
         op.add_option(o_verbose)
     # add newline to description if we have options
@@ -388,8 +401,8 @@ virtual machine.  All subcommands connect to HOST, which is the host to connect
 to as taken by ssh (and so may be of the form username@host).  Make sure your
 SSH keys are in place.
 
-When connecting to JASMIN, your shell will be run as a login shell, which means
-loading, eg. ~/.bash_profile.  Bear in mind the effect this may have on
+When connecting to JASMIN, your shell will be run as a non-login shell, which
+means loading, eg. ~/.bashrc.  Bear in mind the effect this may have on
 executing bash (which may or may not source some configuration files, depending
 on the options given).
 
@@ -448,19 +461,28 @@ VAR_ARGS = {
     'help': 1
 }
 
+GROUPS = {
+    'start': ('global', 'remote'),
+    'getconf': ('global', 'remote', 'conf'),
+    'setconf': ('global', 'remote', 'conf'),
+    'help': ('global',)
+}
+
 DEFAULTS = {
     'global': {
-        'verbose': False
+        'verbose': False,
+    }, 'remote': {
+        'ipython': 'ipython',
+        'login': False,
+        'bash_conf': False
+    }, 'conf': {
+        'profile': 'default'
     }, 'start': {
         'local_port': 8888,
         'remote_port': 8888,
-        'ipython': 'ipython',
         'browser': False
     }, 'getconf': {
-        'profile': 'default'
     }, 'setconf': {
-        'profile': 'default',
-        'local_file': None,
         'no_clobber': False
     }, 'help': {
     }
@@ -498,13 +520,15 @@ if __name__ == '__main__':
         else:
             # no arguments or unknown subcommand
             prog = op.get_prog_name()
-            op.error('expected a subcommand: try `%s help\'' (prog,))
+            op.error('expected a subcommand: try `%s help\'' % (prog,))
             ret = ERR_ARGS
     else:
         # got subcommand: parse options
         cmd = argv[1]
         op = mk_op(cmd)
-        defaults = dict(DEFAULTS['global'])
+        defaults = {}
+        for g in GROUPS[cmd]:
+            defaults.update(DEFAULTS[g])
         defaults.update(DEFAULTS[cmd])
         op.set_defaults(**defaults)
         options, args = op.parse_args(argv[2:])

@@ -1,6 +1,11 @@
 #! /usr/bin/env python
 
-from __future__ import with_statement
+# do version check here, since even imports are version-dependent
+import sys
+
+if sys.version_info < (2, 5):
+    print 'error: Python version is too low; at least 2.5 is required'
+    sys.exit(1)
 
 from sys import exit, argv, stdout, stderr
 from signal import signal, SIGINT, SIGTERM
@@ -12,9 +17,12 @@ from pipes import quote as quote_single
 from webbrowser import open as open_url
 
 # TODO:
-# - getconf option: write to local file
-# - version check/error against sys.version_info
+# - getconf and setconf can take * as component to do for all
+#   - note only makes sense for getconf if writing to file
+#   - note need to escape * in shell
+#   - note if given, setconf's --local-file ignored
 # - option: run notebook server locally and cluster remotely
+#   - or stuff like it - transferring connection files
 # - why are the '\r's needed?
 
 # utilities
@@ -46,9 +54,9 @@ def finish (sig, process):
 def printer_head (category):
     """Construct line start used by message printers."""
     if loud:
-        return '[%s]' % (category.upper(),)
+        return '[%s]' % category.upper()
     else:
-        return '%s:' % (category.lower(),)
+        return '%s:' % category.lower()
 
 def error (msg, code, process = None):
     """Print an error message and exit."""
@@ -86,9 +94,20 @@ The output can be safely run in a shell.
 
 """
     escaped_cmd = ' '.join(quote(arg) for arg in cmd)
-    info('running command:', '[[[ %s ]]]' % (escaped_cmd,))
+    info('running command:', '[[[ %s ]]]' % escaped_cmd)
 
 # subcommands
+
+def translate_ret (ret):
+    """Turn some known error codes into ERR_*."""
+    if ret == 0:
+        return 0
+    elif ret == 127: # shell: command not found
+        return ERR_EXEC
+    elif ret == 255:
+        return ERR_NET
+    else:
+        return ERR_UNKNOWN
 
 def mk_ssh_cmd (host, cmds, bash_conf, login, ssh_opts = []):
     """Construct a command list for the ssh connection."""
@@ -128,7 +147,7 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
     check_ssh()
     # construct ipython command
     ipython_cmd = [quote(ipython), 'notebook', '--no-browser']
-    ipython_cmd.append('--port=%s' % (remote_port,))
+    ipython_cmd.append('--port=%s' % remote_port)
     ipython_cmd += quote(ipython_args)
     # construct shell commands - make sure to quote input
     if directory is not None:
@@ -165,7 +184,7 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
             if str(remote_port) + '/' not in s:
                 # printed port isn't the one we wanted
                 error('couldn\'t set up port forwarding: remote port (%s) ' \
-                      'is in use\r' % (remote_port,), ERR_NET, process)
+                      'is in use\r' % remote_port, ERR_NET, process)
             else:
                 # replace remote with local port
                 stdout.write(s.replace(str(remote_port), str(local_port)))
@@ -176,11 +195,11 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
         if s.startswith(err_line):
             # ssh error
             error('couldn\'t set up port forwarding: local port (%s) is in ' \
-                  'use\r' % (local_port,), ERR_NET, process)
+                  'use\r' % local_port, ERR_NET, process)
     # open in browser
     if success and browser:
-        url = 'http://127.0.0.1:%s/' % (local_port,)
-        info('opening browser to %s\r' % (url,))
+        url = 'http://127.0.0.1:%s/' % local_port
+        info('opening browser to %s\r' % url)
         open_url(url)
     # no way to switch output back to stdout, so we need to relay everything
     while True:
@@ -202,11 +221,11 @@ Returns a tuple of commands; the first must be executed directly, after which
 the second is safe to use as an expression that gives the file path.
 
 """
-    do = 'd="$(ipython locate profile %s)"' % (quote(profile),)
+    do = 'd="$(ipython locate profile %s)"' % quote(profile)
     if component is None:
         return do
     else:
-        return (do, '"$d"/%s_config.py' % (quote(component),))
+        return (do, '"$d"/%s_config.py' % quote(component))
 
 def listconf (host, profile, ipython, print_zero, bash_conf, login):
     """List IPython configuration files on the VM."""
@@ -222,7 +241,7 @@ try:
 except (IOError, OSError):
     fs = []
 fs = [f[:-len('_config.py')] for f in fs if f.endswith('_config.py')]
-print '%s'.join(fs)"''' % (('\\0' if print_zero else '\\n'),)]
+print '%s'.join(fs)"''' % ('\\0' if print_zero else '\\n')]
     ssh_cmd = mk_ssh_cmd(host, cmds, bash_conf, login,
                          [] if verbose else ['-q'])
     # run command
@@ -238,21 +257,59 @@ print '%s'.join(fs)"''' % (('\\0' if print_zero else '\\n'),)]
     info('return code:', ret)
     return translate_ret(ret)
 
-def getconf (host, component, profile, ipython, bash_conf, login):
+def get_local_profile (profile):
+    """Get a list of possible directories the given profile could be in."""
+    home = os.path.expanduser('~')
+    profile_dir = 'profile_' + profile
+    ds = []
+    for d in (('.ipython',), ('.config', 'ipython')):
+        ds.append(join_path(*((home,) + d + (profile_dir,))))
+    return ds
+
+def getconf (host, component, profile, save, local_profile, no_clobber,
+             ipython, bash_conf, login):
     """Get an IPython configuration file from the VM."""
     check_ssh()
+    # find file to save to
+    if save:
+        if local_profile is None:
+            local_profile = profile
+        profile_dir = None
+        for d in get_local_profile(local_profile):
+            if os.path.isdir(d):
+                # use this dir
+                profile_dir = d
+                break
+        if profile_dir is None:
+            msg = 'couldn\'t find local profile \'%s\''
+            error(msg % local_profile, ERR_IO)
+        fn = os.path.join(profile_dir, component + '_config.py')
     # construct command
     do, f = cmd_for_config_file(profile, component)
-    cmds = (do, 'cat %s' % (f,))
+    cmds = (do, 'cat %s' % f)
     ssh_cmd = mk_ssh_cmd(host, cmds, bash_conf, login,
                          [] if verbose else ['-q'])
     # run command
     print_popen_cmd(ssh_cmd)
     try:
-        process = Popen(ssh_cmd)
+        process = Popen(ssh_cmd, stdout = PIPE if save else None)
     except OSError:
         error('couldn\'t run ssh', ERR_EXEC)
-    ret = process.wait()
+    out = process.communicate()[0]
+    # write to file
+    if save:
+        if no_clobber and os.path.exists(fn):
+            warn('not writing to existing file \'%s\'' % fn)
+        else:
+            try:
+                f = open(fn, 'w')
+            except (OSError, IOError):
+                error('couldn\'t write to file \'%s\'' % fn, ERR_IO)
+            else:
+                f.write(out)
+            finally:
+                f.close()
+    ret = process.returncode
     if not verbose and ret == 255:
         # ssh error
         error('ssh: couldn\'t log in to the given host', ERR_NET)
@@ -268,25 +325,23 @@ def setconf (host, component, profile, local_profile, local_file, no_clobber,
         if local_profile is None:
             local_profile = profile
         # try known dirs
-        home = os.path.expanduser('~')
-        profile_dir = 'profile_' + local_profile
         file_name = component + '_config.py'
-        for d in (('.ipython',), ('.config', 'ipython')):
-            f = join_path(*((home,) + d + (profile_dir, file_name)))
+        for d in get_local_profile(local_profile):
+            f = join_path(d, file_name)
             if os.path.isfile(f):
                 local_file = f
                 break
         if local_file is None:
             # didn't find anything
-            msg = 'couldn\'t find %s under profile %s'
-            error(msg % (file_name, local_profile), ERR_OTHER)
+            msg = 'couldn\'t find local file \'%s\' under profile \'%s\''
+            error(msg % (file_name, local_profile), ERR_IO)
     # construct command
     cmds = []
     if no_clobber:
         cmds.append('set -o noclobber') # assuming Bash
     do, f = cmd_for_config_file(profile, component)
     cmds.append(do)
-    cmds.append('tee > %s' % (f,))
+    cmds.append('tee > %s' % f)
     ssh_cmd = mk_ssh_cmd(host, cmds, bash_conf, login,
                          [] if verbose else ['-q'])
     # run command
@@ -297,10 +352,13 @@ def setconf (host, component, profile, local_profile, local_file, no_clobber,
         error('couldn\'t run ssh', ERR_EXEC)
     # pass config file on stdin
     try:
-        with open(local_file, 'r') as f:
-            data = f.read()
+        f = open(local_file, 'r')
     except (IOError, OSError):
-        error('couldn\'t read file \'%s\'' % (local_file,), ERR_OTHER)
+        error('couldn\'t read local file \'%s\'' % local_file, ERR_IO)
+    else:
+        data = f.read()
+    finally:
+        f.close()
     process.communicate(data)
     ret = process.returncode
     if not verbose and ret == 255:
@@ -339,22 +397,11 @@ def help_cmd (cmd = None):
         op = mk_op_basic(*SUBCOMMANDS)
     elif cmd not in SUBCOMMANDS:
         op = mk_op_basic(*SUBCOMMANDS)
-        op.error('help: invalid command: \'%s\'' % (cmd,))
+        op.error('help: invalid subcommand: \'%s\'' % cmd)
     else:
         op = mk_op(cmd)
     op.print_help()
     return 0
-
-def translate_ret (ret):
-    """Turn some known error codes into ERR_*."""
-    if ret == 0:
-        return 0
-    elif ret == 127: # shell: command not found
-        return ERR_EXEC
-    elif ret == 255:
-        return ERR_NET
-    else:
-        return ERR_UNKNOWN
 
 # option parser constructors
 
@@ -393,7 +440,8 @@ def mk_op (cmd):
                   help = 'print more information')
     if 'remote' in groups:
         o_ipython = O('-i', '--ipython', action = 'store', type = 'string',
-                      help = 'path to ipython executable (default: %default)')
+                      help = 'path to ipython executable on the remote ' \
+                             'machine (default: %default)')
         o_bash_conf = O('-c', '--bash-conf', action = 'store_true',
                         help = 'when running bash on the virtual machine, ' \
                                'source its configuration files (not done by ' \
@@ -427,7 +475,18 @@ def mk_op (cmd):
                              'of newlines')
         op.add_options((o_bash_conf, o_login, o_verbose))
     elif cmd == 'getconf':
-        op.add_options((o_profile, o_ipython, o_bash_conf, o_login, o_verbose))
+        op.add_options((o_profile,))
+        op.add_option('-s', '--save', action = 'store_true',
+                      help = 'save the output to the local configuration ' \
+                             'file, instead of printing it')
+        op.add_option('-l', '--local-profile', action = 'store',
+                      type = 'string',
+                      help = 'local IPython configuration profile to use ' \
+                             'with --save (defaults to PROFILE)')
+        op.add_option('-n', '--no-clobber', action = 'store_true',
+                      help = 'with --save, don\'t overwrite the local file ' \
+                             'if it exists ')
+        op.add_options((o_ipython, o_bash_conf, o_login, o_verbose))
     elif cmd == 'setconf':
         op.add_option(o_profile)
         op.add_option('-l', '--local-profile', action = 'store',
@@ -461,7 +520,7 @@ def mk_op (cmd):
 ERR_EXEC = 1
 ERR_ARGS = 2 # optparse uses this
 ERR_NET = 3
-ERR_OTHER = 4
+ERR_IO = 4
 ERR_UNKNOWN = 5
 
 SUBCOMMANDS = ('start', 'listconf', 'getconf', 'setconf', 'createconf', 'help')
@@ -500,8 +559,8 @@ the script terminates.
 The exit status in the case of an error is:\\n
     1: couldn't execute a command\\n
     2: incorrect arguments\\n
-    3: network error (couldn't connect)\\n
-    4: any other known error\\n
+    3: network error\\n
+    4: local I/O error\\n
     5: unknown error
 
 For help with a subcommand, pass `help SUBCOMMAND'.''',
@@ -578,6 +637,8 @@ DEFAULTS = {
     }, 'listconf': {
         'print_zero': False,
     }, 'getconf': {
+        'save': False,
+        'no_clobber': False
     }, 'setconf': {
         'no_clobber': False
     }, 'createconf': {
@@ -625,7 +686,7 @@ if __name__ == '__main__':
         else:
             # no arguments or unknown subcommand
             prog = op.get_prog_name()
-            op.error('expected a subcommand: try `%s help\'' % (prog,))
+            op.error('expected a subcommand: try `%s help\'' % prog)
             ret = ERR_ARGS
     else:
         # got subcommand: parse options

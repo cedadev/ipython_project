@@ -76,7 +76,9 @@ Takes the same arguments as netCDF4.Dataset.
 
 An instance passed for serialisation remains open itself, and each time the
 serialised data is unserialised, it yields an open Dataset pointing to the same
-file as the original Dataset.  Make sure to close all of these.
+file as the original Dataset.  Make sure to close all of these.  Note that the
+file must be accessible at the same location in the unserialising environment
+as in the serialising environment.
 
 It is possible to pass a closed instance for serialisation, and the
 unserialised instance will still be open.

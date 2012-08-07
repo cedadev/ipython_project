@@ -18,9 +18,10 @@ from pipes import quote as quote_single
 from webbrowser import open as open_url
 
 # TODO:
+# - in setconf, if clobbering, don't bother fetching remote list
+# - in getconf, can do this and just handle errors through scp?
 # - option: run notebook server locally and cluster remotely
 #   - or stuff like it - transferring connection files
-# - why are the '\r's needed?
 
 # utilities
 

@@ -36,7 +36,7 @@ def _construct_slots (cls, attrs):
 
 def _reduce_slots (o):
     attrs = dict((k, getattr(o, k)) for k in o.__slots__ if hasattr(o, k))
-    return _construct_slots, (type(o), attrs,)
+    return _construct_slots, (type(o), attrs)
 
 def mk_slots (*objs):
     """Make the classes that have __slots__ but not __dict__ serialisable.

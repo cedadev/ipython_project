@@ -104,7 +104,7 @@ def translate_ret (ret, ssh_quiet = False):
     elif ret == 127: # shell: command not found
         return ERR_EXEC
     elif ret == 255:
-        if verbose and ssh_quiet:
+        if not verbose and ssh_quiet:
             error('ssh: couldn\'t log in to the given host', ERR_NET)
         else:
             return ERR_NET
@@ -291,19 +291,19 @@ def get_local_profile_dir (profile, fallback_profile, override_dir):
 
 def get_local_components (profile_dir):
     """Get IPython configuration files in the given directory as components."""
+    profile_dir.rstrip(os.sep)
     files = glob(join_path(profile_dir, '*_config.py'))
-    return [f[:-len('_config.py')] for f in files]
+    return [f[len(profile_dir) + 1:-len('_config.py')] for f in files]
 
 def filter_existing_components (components, pool, because_exists):
     """Reduce components to a subset of the given pool."""
     cs = set(components)
     components = []
     for c in cs:
-        if c not in pool:
-            if because_exists:
-                warn('skipping component \'%s\': file exists' % c)
-            else:
-                warn('skipping non-existent component: \'%s\'' % c)
+        if c in pool and because_exists:
+            warn('skipping component \'%s\': file exists' % c)
+        if c not in pool and not because_exists:
+            warn('skipping non-existent component: \'%s\'' % c)
         else:
             components.append(c)
     return components

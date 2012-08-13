@@ -63,7 +63,7 @@ Call this before importing any module that uses netCDF4.
         return
 
     import sys
-    import ncserialisable
+    from nc_ipython import ncserialisable
 
     sys.modules['netCDF4'] = ncserialisable
 

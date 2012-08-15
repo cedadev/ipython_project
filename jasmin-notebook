@@ -20,8 +20,6 @@ from webbrowser import open as open_url
 # TODO:
 # - in setconf, if clobbering, don't bother fetching remote list
 # - in getconf, can do this and just handle errors through scp?
-# - option: run notebook server locally and cluster remotely
-#   - or stuff like it - transferring connection files
 
 # utilities
 
@@ -155,19 +153,11 @@ def start (host, ipython_args, local_port, remote_port, directory, ipython,
     """Start the IPython notebook on the VM."""
     check_ssh()
     # construct ipython command
-    ipython_cmd = [quote(ipython), 'notebook', '--no-browser']
-    ipython_cmd.append('--port=%s' % remote_port)
-    ipython_cmd += quote(ipython_args)
-    # construct shell commands - make sure to quote input
+    cmds = [quote(ipython), 'notebook', '--no-browser']
+    cmds.append('--port=%s' % remote_port)
     if directory is not None:
-        cmds = [('cd', quote(directory))]
-        if verbose:
-            cmds.append('echo [INFO] now in \\"`pwd`\\" 1>&2')
-    else:
-        cmds = []
-    cmds.append(['exec'] + ipython_cmd)
-    cmds = [cmd if isinstance(cmd, basestring) else ' '.join(cmd) \
-            for cmd in cmds]
+        cmds.append('--notebook-dir=%s' % quote(directory))
+    cmds = [' '.join(['exec'] + cmds + quote(ipython_args))]
     # run
     ssh_opts = ['-t', '-L%s:localhost:%s' % (local_port, remote_port)]
     process = run_ssh(host, cmds, bash_conf, login, ssh_opts, stdout = PIPE,
@@ -573,8 +563,9 @@ For help with a subcommand, pass `help SUBCOMMAND'.''',
     'start':
 '''Start the notebook server and forward the web interface over an SSH
 connection to a local port.  IPYTHON_OPTS are any number of extra arguments to
-pass to the ipython command, but should not include the --port option.  If any
-start with `-', make sure to pass `--' first.''',
+pass to the ipython command, but should not include the --port or
+--notebook-dir options.  If any start with `-', make sure to pass `--'
+first.''',
     'listconf':
 '''List IPython configuration files present on the JASMIN virtual machine.
 These are in the form of COMPONENT, which %s''' % component_desc,

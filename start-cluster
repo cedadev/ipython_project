@@ -1,0 +1,559 @@
+#! /usr/bin/env python
+
+# NOTE:
+# - need to have used SSH between hosts before, so that fingerprint has been accepted
+# - controller must be on a host to which SSH connections are passwordless
+# - shell config files mustn't print anything to stdout
+# - runs Python as 'python' everywhere
+# - hosts in config are as known by SSH from this machine
+# - get _lots_ of log files
+
+# TODO:
+# - don't clobber existing files with logs
+# - configurable ip* paths - in config, per-host: have "host_options": {HOST: {...}}
+# - better errors
+# - maybe run ipengine instead of ipcluster so we can use --ssh and track each individually - but then we have more local ssh processes
+# - can set client/engine ports for manual forwarding?
+# - --log-dir/--no-log options (need to keep some in pipes for reading, rest > /dev/null)
+# - check for asking for password
+# - check for asking for fingerprint confirmation
+# - check for stalled engines
+# - restart processes if they die?  Careful of changed connection files
+# - initial notebook dir
+# - careful with log file names with multiple nb/engine definitions on same host
+# - handle user@host-style hostnames
+# - don't let given notebook ports be used in tunneling
+# - check for notebooks on the same host using the same port
+# - scary warning on connect
+
+from sys import argv, exit
+from time import strftime, sleep
+from signal import signal, SIGINT, SIGTERM, SIGHUP
+from subprocess import Popen, PIPE
+import shlex
+import socket
+import json
+from pipes import quote
+
+
+HELP = '''Usage: start-cluster CONFIG_FILE
+
+This script starts an IPython cluster across multiple machines according to the
+configuration file CONFIG_FILE.  This is a JSON file containing a dict with
+keys:
+    controller: controller host.
+    engines [optional]: a dict of engines to run.  Keys are hosts and values
+                        are the numbers of engines to run.
+    notebooks [optional]: a list of hosts to run notebook servers on.
+
+In each case, a host is a dict with keys:
+    host: the hostname or IP, as you would pass to SSH to connect to it,
+          excluding the port (user@host is not currently supported).
+    profile [default = 'default']: IPython profile to use for this process.
+
+Notebook hosts have the following keys instead:
+    host: as above.
+    port [default = 8888]: Port to listen on for notebook connections.
+    profile: as above.
+    options: a list of extra command-line options to pass to the notebook
+             server (should not contain --port).  --no-browser is appended
+             automatically if this is not running on the local machine.
+
+Hosts may also be given as strings or lists.  Lists contain values in the same
+order as keys are listed above, and possibly truncated to exclude any trailing
+optional arguments.  Strings contain the same arguments separated by `:'
+characters; leave sections empty for defaults, and note that this form cannot
+handle arguments that are lists.  For example, the following are equivalent:
+    "somehost"
+    "somehost:default"
+    ["somehost"]
+    ["somehost", "default"]
+    {"host": "somehost"}
+    {"host": "somehost", "profile": "default"}
+
+A full example, which runs the controller, notebook server and 2 engines on
+`host1', 4 engines on `host2' and 4 engines locally:
+
+{
+    "controller": "host1:another_profile",
+    "engines": {
+        "localhost:remote_profile": 4,
+        "host1": 2,
+        "host2": 4
+    },
+    "notebooks": [
+        {
+            "host": "host1",
+            "port": 5000,
+            "options": ["--notebook-dir=~/ipython", "--pylab=inline"]
+        }
+    ]
+}
+
+Log files from every process this script runs are saved in the working
+directory; if something doesn't work, look through these first.
+
+Known issues:
+ - Connections might hang on fingerprint confirmation, even if you've made the
+   same connection before, because of the way they are made.  You might need to
+   find these errors in the log files and manually perform all the connections
+   once.
+ - SSH connections from the local machine to any host and from any host to the
+   controller's host must be passwordless.
+ - Things will go wrong if your shell configuration files on any remote host
+   print anything to stdout.
+ - python, ipython, ipcontroller and ipengine are assumed to be on the path
+   where they are used (python and ipython on every host).
+ - You can end up with a /lot/ of log files.
+
+To stop this script and all running components, send one of SIGINT, SIGTERM or
+SIGHUP (or ctrl-C).
+
+The exit status in the case of an error is:
+    1: invalid configuration file
+    2: couldn't execute a command
+    3: local I/O error'''
+
+
+ERR_CONF = 1
+ERR_EXEC = 2
+ERR_IO = 3
+
+
+WAIT_TO_KILL = 5
+PORTS = {'regport': 0, 'control': (7, 1), 'hb': (2, 3), 'iopub': (8, 4),
+         'mux': (9, 5), 'task': (10, 6)}
+
+
+def err (msg, code):
+    """Print an error message and exit."""
+    print 'error:', msg
+    exit(code)
+
+
+class Launcher:
+    """Handles starting up a cluster over SSH, including forwarding ports."""
+
+    def __init__ (self):
+        self.log_prefix = strftime('%F-%T')
+        self.hosts = {}
+        self.ports = {}
+        self.ipy_dirs = {}
+        self.processes = []
+        self.stopping = False
+        self._stopped = True
+        # add localhost so that we don't ssh to aliases for it to check their
+        # IPs
+        self.host('localhost')
+
+    def launch (self, controller, engines, notebooks):
+        """Start the cluster.
+
+Takes the 'controller', 'engines' and 'notebooks' fields from the
+configuration file.
+
+"""
+        if self.stopping:
+            raise RuntimeError('can\'t launch while stopping')
+        if not self._stopped:
+            raise RuntimeError('already running: can\'t launch again')
+        self._stopped = False
+        # controller
+        c_host, c_profile = self.host(controller)
+        # pass options for ports so we know what they are
+        c_ports = self.get_ports(c_host, 'all')
+        e_ports = self.get_ports(c_host, 'engine')
+        cl_ports = self.get_ports(c_host, 'client')
+        port_opts = []
+        for ident, js in PORTS.iteritems():
+            if isinstance(js, int):
+                js = (js,)
+            ports = ','.join(str(c_ports[j]) for j in js)
+            port_opts.append('--HubFactory.%s=%s' % (ident, ports))
+        cmd = ['ipcontroller', '--profile=%s' % c_profile] + port_opts
+        self.run_on(c_host, cmd, 'controller')
+        # get hosts that will connect to controller
+        connecting_hosts = {}
+        for is_notebook, hosts in enumerate((engines, notebooks)):
+            for host in hosts:
+                host = self.host(host, is_notebook)[0]
+                if host != c_host:
+                    n = 2 if is_notebook else 1
+                    connecting_hosts[host] = connecting_hosts.get(host, 0) | n
+        # forward ports
+        for host, types in connecting_hosts.iteritems():
+            if types == 1:
+                ports = e_ports
+            elif types == 2:
+                ports = cl_ports
+            else: # types == 3
+                ports = c_ports
+            self.tunnel(host, c_host, ports)
+        # engines
+        for engine, num in engines.iteritems():
+            e_host, e_profile = self.host(engine)
+            if (e_host, e_profile) != (c_host, c_profile):
+                self.copy_con_file(c_host, c_profile, e_host, e_profile,
+                                   'engine')
+            for i in xrange(num):
+                self.run_on(e_host, ('ipengine', '--profile=%s' % e_profile),
+                            role = 'engine-%s' % i)
+        # notebooks
+        for notebook in notebooks:
+            n_host, n_port, n_profile, opts = self.host(notebook, True)
+            if (n_host, n_profile) != (c_host, c_profile):
+                self.copy_con_file(c_host, c_profile, n_host, n_profile,
+                                   'client')
+            opts = [str(o) for o in opts]
+            if n_host == 'localhost':
+                opts.append('--no-browser')
+            cmd = ['ipython', 'notebook', '--profile=%s' % n_profile,
+                   '--port=%s' % n_port] + opts
+            self.run_on(n_host, cmd, 'notebook')
+
+    def wait (self):
+        """Do nothing until the launcher is stopped or a subprocess dies."""
+        # this should remain a reference to the process list
+        ps = self.processes
+        while True:
+            # quit if stopped
+            if self.stopping or self._stopped:
+                exit(0)
+            # or nothing is running
+            if not ps:
+                err('no processes running: stopping...', ERR_EXEC)
+            # or any subprocesses have stopped
+            finished = [i for p, fs, i in ps if p.poll() is not None]
+            if finished:
+                self.bail_out('one or more processes died or was killed:\n' + \
+                              '\n'.join(finished), ERR_EXEC)
+            sleep(1)
+
+    def stop (self, *args):
+        """Stop all subprocesses."""
+        if self.stopping or self._stopped:
+            return
+        print 'stopping processes...'
+        self.stopping = True
+        # try TERM
+        processes = self.processes
+        for p, fs, i in processes:
+            if p.poll() is None:
+                print 'stop', i
+                try:
+                    p.terminate()
+                except OSError:
+                    # already finished
+                    pass
+        # wait for a while
+        for j in xrange(int(WAIT_TO_KILL / .1)):
+            if any(p.poll() is None for p, fs, i in processes):
+                sleep(.1)
+            else:
+                break
+        # clean up
+        for p, fs, i in processes:
+            # resort to KILL for still-running processes
+            if p.poll() is None:
+                print 'kill', i
+                try:
+                    p.kill()
+                except OSError:
+                    # already finished
+                    pass
+            # close log files
+            for f in fs:
+                f.close()
+        self.stopping = False
+        self._stopped = True
+
+    def bail_out (self, msg, code):
+        """Die gracefully."""
+        print 'error:', msg
+        self.stop()
+        exit(code)
+
+    def log_files (self, *data):
+        """Return stdout/stderr log file names for a process.
+
+Takes any number of arguments, which are just things that identify this
+process.
+
+Returns ((stdout, stderr), ident), where ident is a string identifier for this
+process.
+
+"""
+        nice_data = []
+        for s in data:
+            nice_s = s.replace('%', '%%').replace('\0', '%')
+            nice_data.append(nice_s.replace('#', '##').replace('/', '#'))
+        ident = '-'.join(nice_data)
+        log_file = '%s-%s-%s.log' % (self.log_prefix, ident, '%s')
+        return ((log_file % 'stdout', log_file % 'stderr'), ident)
+
+    def run_cmd (self, cmd, log_files, ident, wait):
+        """Run a command and direct its output to log files."""
+        printable_cmd = ' '.join(quote(arg) for arg in cmd)
+        print printable_cmd
+        # open log files
+        fs = []
+        for fn in log_files:
+            try:
+                f = open(fn, 'w')
+            except IOError:
+                for f in fs:
+                    f.close()
+                msg = 'couldn\'t open log file for writing: \'%s\''
+                self.bail_out(msg % fn, ERR_IO)
+            else:
+                fs.append(f)
+        # run command
+        try:
+            p = Popen(cmd, stdin = PIPE, stdout = fs[0], stderr = fs[1])
+        except OSError:
+            # might have failed because we're stopping
+            if self.stopping or self._stopped:
+                exit(0)
+            else:
+                self.bail_out('couldn\'t run command: \'%s\'' % printable_cmd,
+                              ERR_EXEC)
+        if wait:
+            ret = p.wait()
+            f.close()
+            # might have failed because we're stopping
+            if self.stopping or self._stopped:
+                exit(0)
+            elif ret != 0:
+                msg = 'command returned non-zero exit status (%s): \'%s\''
+                self.bail_out(msg % (ret, printable_cmd), ERR_EXEC)
+        else:
+            self.processes.append((p, fs, ident))
+
+    def run_on (self, host, cmd, role, wait = False):
+        """Run a command on the given host over SSH.
+
+Returns the (stdout, stderr) log files written to.
+
+"""
+        log_files, ident = self.log_files(host, role)
+        if host != 'localhost':
+            cmd = ('ssh', '-tt', host, ' '.join(quote(arg) for arg in cmd))
+        self.run_cmd(cmd, log_files, ident, wait)
+        return log_files
+
+    def tunnel (self, host_from, host_to, ports):
+        """Open an SSH tunnel between two hosts to forward some ports."""
+        port_opts = ['-L%s:localhost:%s' % (p, p) for p in ports]
+        # this will ssh to host_from first, if necessary
+        self.run_on(host_from, ['ssh', host_to, '-N'] + port_opts,
+                    'forward-port')
+
+    def get_output (self, host, cmd, role):
+        """Run a command and return its stdout."""
+        log_files = self.run_on(host, cmd, role, True)
+        try:
+            with open(log_files[0]) as f:
+                out = f.read()
+        except IOError:
+            msg = 'couldn\'t open log file for reading: \'%s\''
+            self.bail_out(msg % log_files[0], ERR_IO)
+        else:
+            return out
+
+    def get_profile_dir (self, host, profile):
+        """Get the directory of an IPython profile on the given host."""
+        if host in self.ipy_dirs:
+            # retrieve from cache
+            ipy_dir = self.ipy_dirs[host]
+        else:
+            ipy_dir = self.get_output(host, ('ipython', 'locate'), 'locate')
+            ipy_dir = ipy_dir.strip().rstrip('/')
+            # cache result
+            self.ipy_dirs[host] = ipy_dir
+        return '%s/profile_%s' % (ipy_dir, profile)
+
+    def copy_con_file (self, host_from, profile_from, host_to, profile_to,
+                       ident):
+        """Copy a connection file between hosts.
+
+Returns the (stdout, stderr) log files written to.
+
+"""
+        log_files, p_ident = self.log_files(host_from, host_to, 'copy', ident)
+        # get file paths
+        f_from = self.get_profile_dir(host_from, profile_from)
+        f_from = '%s/security/ipcontroller-%s.json' % (f_from, ident)
+        f_to = self.get_profile_dir(host_to, profile_to)
+        f_to = '%s/security/ipcontroller-%s.json' % (f_to, ident)
+        # construct hosts for scp
+        if host_from == 'localhost':
+            host_from = f_from
+        else:
+            host_from = ':'.join((host_from, f_from))
+        if host_to == 'localhost':
+            host_to = f_to
+        else:
+            host_to = ':'.join((host_to, f_to))
+        self.run_cmd(('scp', host_from, host_to), log_files, p_ident, True)
+        return log_files
+
+    def host (self, host, notebook = False):
+        """Parse configuration host object and register aliases."""
+        types = {'options': list}
+        defaults = {'port': 8888, 'profile': 'default', 'options': []}
+        if notebook:
+            fields = ['port', 'profile', 'options']
+        else:
+            fields = ['profile']
+        fields.insert(0, 'host')
+        if isinstance(host, basestring):
+            # ':'-separated fields in a string
+            data = host.split(':')
+        elif isinstance(host, dict):
+            # field: value dict
+            for k in fields:
+                if k not in defaults and k not in host:
+                    self.bail_out('dict-style hosts need a \'%s\' field' % k,
+                                  ERR_CONF)
+            data = [host.get(k, defaults.get(k)) for k in fields]
+        else:
+            # list of fields
+            try:
+                data = [v for v in host]
+            except (TypeError, ValueError):
+                self.bail_out('invalid host format: %s' % repr(host), ERR_CONF)
+        # check types
+        for i, (k, v) in enumerate(zip(fields, data)):
+            if not v:
+                continue
+            t = types.get(k, str)
+            if not isinstance(v, t):
+                try:
+                    v = t(v)
+                except (TypeError, ValueError):
+                    msg = 'invalid host format for \'%s\' field: %s'
+                    self.bail_out(msg % (k, repr(v)), ERR_CONF)
+            data[i] = v
+        # fill in defaults
+        data = data[:len(fields)]
+        while len(data) < len(fields):
+            data.append(None)
+        for i, k in enumerate(fields):
+            # check for: just appended None, or was empty in the string
+            if not data[i]:
+                data[i] = defaults[k]
+        host = data[0]
+        # get all names and add to storage
+        all_hosts = self.hosts
+        if host in all_hosts:
+            # known host
+            host = all_hosts[host]
+        else:
+            if host == 'localhost':
+                # get hosts locally
+                name = socket.gethostname()
+                name, names, ips = socket.gethostbyname_ex(name)
+                hosts = ['localhost', '127.0.0.1', name] + names + ips
+            else:
+                # get hosts remotely
+                hosts = self.get_output(host, ('python', '-c', '''
+import socket
+name, names, ips = socket.gethostbyname_ex(socket.gethostname())
+print '\\n'.join([name] + names + ips)
+'''), 'get-hostnames')
+                hosts = [h.strip() for h in hosts.split('\n') if h.strip()]
+                hosts.append(host)
+                host = hosts[0]
+            for h in set(hosts):
+                all_hosts[h] = host
+        data[0] = host
+        return data
+
+    def get_ports (self, host, which):
+        """Get and store a list of suitable ports on the given host."""
+        if which == 'all':
+            need = 11
+        elif which == 'engine':
+            need = 7
+        elif which == 'client':
+            need = 5
+        else:
+            raise ValueError('invalid which argument')
+        ports = self.ports.setdefault(host, [])
+        got = len(ports)
+        real_which = which
+        # retrieve from cache if available
+        if got == need:
+            return ports
+        elif got == 11: # which != 'all'
+            if which == 'engine':
+                return ports[:7]
+            else: # which == 'client'
+                return ports[:1] + ports[7:11]
+        elif got > 0:
+            if which == 'all':
+                need -= got
+                which = 'engine' if got == 5 else 'client'
+            else:
+                need -= 1
+        # generate port list
+        core_code = '''
+new_ports = []
+for i in xrange(%s):
+    while True:
+        sock = socket.socket()
+        sock.bind(('', 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        if port not in new_ports and port not in ports:
+            new_ports.append(port)
+            break
+'''
+        if host == 'localhost':
+            exec(core_code % need)
+        else:
+            new_ports = self.get_output(host, ('python', '-c', ('''
+import socket
+ports = %s
+''' + core_code + '''
+print '\\n'.join(str(p) for p in new_ports)
+''') % (repr(ports), need)), 'get-ports-' + which)
+            new_ports = [int(p.strip()) for p in new_ports.split('\n')
+                         if p.strip()]
+        # add to existing port list
+        if got == 0 or which == 'client':
+            ports += new_ports
+        else: # which == 'engine' (since if which == 'all', got == 0)
+            for port in new_ports:
+                ports.insert(1, port)
+        return self.get_ports(host, real_which)
+
+
+if __name__ == '__main__':
+    if len(argv) < 2 or argv[0] in ('-h', '--help'):
+        print HELP
+        exit(0)
+    # load configuration file
+    config = argv[1]
+    try:
+        with open(config) as f:
+            config = json.load(f)
+    except IOError:
+        err('configuration file not found', ERR_CONF)
+    except ValueError:
+        err('invalid configuration file: not valid JSON', ERR_CONF)
+    if not isinstance(config, dict) or 'controller' not in config:
+        err('invalid configuration file: a controller is required', ERR_CONF)
+    engines = config.get('engines', {})
+    if not isinstance(engines, dict):
+        err('invalid configuration file: engines must be a dict', ERR_CONF)
+    notebooks = config.get('notebooks', [])
+    if not isinstance(notebooks, list):
+        err('invalid configuration file: notebooks must be a list', ERR_CONF)
+    # start launcher
+    l = Launcher()
+    for sig in (SIGINT, SIGTERM, SIGHUP):
+        signal(sig, l.stop)
+    l.launch(config['controller'], engines, notebooks)
+    # wait for a subprocess to die or a signal to this process
+    l.wait()

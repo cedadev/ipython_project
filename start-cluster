@@ -2,11 +2,9 @@
 
 # TODO:
 # - handle user@host-style hostnames
-# - don't let given notebook ports be used in tunneling
 # - configurable ip* paths - in config, per-host: have "paths": {HOST: [...]}
 # - don't clobber existing files with logs
 # - can set client/engine ports for manual forwarding?
-# - check for notebooks on the same host using the same port
 # - --log-dir/--no-log options (need to keep some in pipes for reading, rest > /dev/null)
 # - --debug option
 # - check for asking for fingerprint confirmation
@@ -108,7 +106,7 @@ ERR_CONF = 1
 ERR_EXEC = 2
 ERR_IO = 3
 
-DEBUG = False
+DEBUG = True
 WAIT_TO_KILL = 5
 PORTS = {'regport': 0, 'control': (7, 1), 'hb': (2, 3), 'iopub': (8, 4),
          'mux': (9, 5), 'task': (10, 6)}
@@ -148,9 +146,27 @@ configuration file.
             raise RuntimeError('already running: can\'t launch again')
         self._stopped = False
         self._has_con_file = {'engine': [], 'client': []}
-        # controller
         c_host, c_profile = self.host(controller)
-        # pass options for ports so we know what they are
+        # get hosts that will connect to controller, and notebook ports
+        connecting_hosts = {}
+        n_ports = []
+        for is_notebook, hosts in enumerate((engines, notebooks)):
+            for host in hosts:
+                data = self.host(host, is_notebook)
+                host = data[0]
+                if is_notebook:
+                    # add notebook port to list, and check for conflicts
+                    port_data = (data[1], host)
+                    if port_data in n_ports:
+                        msg = 'multiple notebooks are using port %s on %s'
+                        self.bail_out(msg % port_data, ERR_CONF)
+                    n_ports.append(port_data)
+                if host != c_host:
+                    n = 2 if is_notebook else 1
+                    connecting_hosts[host] = connecting_hosts.get(host, 0) | n
+        # disallow using notebook ports for controller
+        self._used_ports = list(set([p for p, h in n_ports]))
+        # controller: pass options for ports so we know what they are
         c_ports = self.get_ports(c_host, 'all')
         e_ports = self.get_ports(c_host, 'engine')
         cl_ports = self.get_ports(c_host, 'client')
@@ -162,14 +178,6 @@ configuration file.
             port_opts.append('--HubFactory.%s=%s' % (ident, ports))
         cmd = ['ipcontroller', '--profile=%s' % c_profile] + port_opts
         self.run_on(c_host, cmd, 'controller')
-        # get hosts that will connect to controller
-        connecting_hosts = {}
-        for is_notebook, hosts in enumerate((engines, notebooks)):
-            for host in hosts:
-                host = self.host(host, is_notebook)[0]
-                if host != c_host:
-                    n = 2 if is_notebook else 1
-                    connecting_hosts[host] = connecting_hosts.get(host, 0) | n
         # forward ports
         for host, types in connecting_hosts.iteritems():
             if types == 1:
@@ -402,7 +410,7 @@ it was unnecessary, and the return value is None).
 
     def host (self, host, notebook = False):
         """Parse configuration host object and register aliases."""
-        types = {'options': list}
+        types = {'port': int, 'options': list}
         defaults = {'port': 8888, 'profile': 'default', 'options': []}
         if notebook:
             fields = ['port', 'profile', 'options']
@@ -500,6 +508,7 @@ print '\\n'.join([name] + names + ips)
             else:
                 need -= 1
         # generate port list
+        used_ports = ports + self._used_ports
         core_code = '''
 new_ports = []
 for i in xrange(%s):
@@ -508,7 +517,7 @@ for i in xrange(%s):
         sock.bind(('', 0))
         port = sock.getsockname()[1]
         sock.close()
-        if port not in new_ports and port not in ports:
+        if port not in new_ports and port not in used_ports:
             new_ports.append(port)
             break
 '''
@@ -517,10 +526,10 @@ for i in xrange(%s):
         else:
             new_ports = self.get_output(host, ('python', '-c', ('''
 import socket
-ports = %s
+used_ports = %s
 ''' + core_code + '''
 print '\\n'.join(str(p) for p in new_ports)
-''') % (repr(ports), need)), 'get-ports-' + which)
+''') % (repr(used_ports), need)), 'get-ports-' + which)
             new_ports = [int(p.strip()) for p in new_ports.split('\n')
                          if p.strip()]
         # add to existing port list

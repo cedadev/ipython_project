@@ -38,15 +38,18 @@ keys:
 In each case, a host is a dict with keys:
     host: the hostname or IP, as you would pass to SSH to connect to it,
           excluding the port (user@host is not currently supported).
-    profile [default = 'default']: IPython profile to use for this process.
-
-Notebook hosts have the following keys instead:
-    host: as above.
     port [default = 8888]: Port to listen on for notebook connections.
-    profile: as above.
+    profile [default = 'default']: IPython profile to use for this process.
     options: a list of extra command-line options to pass to the notebook
              server (should not contain --port).  --no-browser is appended
              automatically if this is not running on the local machine.
+    clients: a list of hosts to forward the notebook's port to.
+
+The accepted keys depends on the type of host:
+    notebooks: host, port, profile, options, clients.
+    notebook clients: host, port (port is the port on the client to bind the
+                      notebook server's port to).
+    all others: host, profile.
 
 Hosts may also be given as strings or lists.  Lists contain values in the same
 order as keys are listed above, and possibly truncated to exclude any trailing
@@ -167,46 +170,67 @@ configuration file.
         c_host, c_profile = self.host(controller)
         # get hosts that will connect to controller, sort by host, and disallow
         # using notebook ports for controller connections
-        connecting_hosts = {}
-        component_hns = {}
+        toctrl_hosts = {}
+        hostnames = []
         self._used_ports = used_ports = {}
         for t, hosts in ((ENGINE, engines), (CLIENT, notebooks)):
-            is_notebook = t == CLIENT
-            hns = []
             for host in hosts:
-                data = self.host(host, is_notebook)
+                data = self.host(host, None if t == ENGINE else 'nb')
                 host = data[0]
-                hns.append(host)
-                if is_notebook:
+                hostnames.append(host)
+                if t == CLIENT:
                     # add notebook port to list, and check for conflicts
                     port = data[1]
-                    this_used = used_ports.setdefault(host, set())
+                    this_used = used_ports.setdefault(host, [])
                     if port in this_used:
-                        msg = 'multiple notebooks are using port %s on %s'
+                        msg = 'multiple components are using port %s on %s'
                         self.bail_out(msg % (port, host), ERR_CONF)
-                    this_used.add(port)
+                    this_used.append(port)
                 if host != c_host:
-                    connecting_hosts[host] = connecting_hosts.get(host, 0) | t
-            component_hns[t] = list(set(hns))
-            # make connection host first, if present
-            if c_host in hns:
-                hns.insert(0, hns.pop(hns.index(c_host)))
+                    toctrl_hosts[host] = toctrl_hosts.get(host, 0) | t
+        hostnames = list(set(hostnames))
+        # make connection host first, if present
+        if c_host in hostnames:
+            hostnames.insert(0, hostnames.pop(hostnames.index(c_host)))
+        # notebook clients
+        connecting_hosts = {}
+        for notebook in notebooks:
+            data = self.host(notebook, 'nb')
+            n_host, n_port = data[:2]
+            hosts = connecting_hosts.setdefault(n_host, {})
+            for client in data[4]:
+                host, port = self.host(client, 'nbclient')
+                # check for conflicts
+                this_used = used_ports.setdefault(host, [])
+                if port in this_used:
+                    msg = 'multiple components are using port %s on %s'
+                    self.bail_out(msg % (port, host), ERR_CONF)
+                this_used.append(port)
+                if host != n_host:
+                    hosts.setdefault(host, []).append((port, n_port))
         # controller: pass options for ports so we know what they are
         port_opts = self.get_ports(c_host, ALL, 'cmdline')
         cmd = ['ipcontroller', '--profile=%s' % c_profile] + port_opts
         self.run_on(c_host, cmd, 'controller')
-        # forward ports
+        # get ports to forward to controller
         c_ports = self.get_ports(c_host, ALL, 'ident')
-        for host, types in connecting_hosts.iteritems():
+        for host, types in toctrl_hosts.iteritems():
             ports = self.get_ports(host, types, 'ident')
-            ports = [(ports[ident], c_ports[ident]) for ident in ports]
-            self.tunnel(host, c_host, ports)
+            toctrl_hosts[host] = [(ports[ident], c_ports[ident])
+                                  for ident in ports]
+        toctrl_hosts_new = connecting_hosts.setdefault(c_host, {})
+        for host in toctrl_hosts:
+            toctrl_hosts_new.setdefault(host, []).extend(toctrl_hosts[host])
+        # forward ports
+        for to_host, hosts in connecting_hosts.iteritems():
+            for host, ports in hosts.iteritems():
+                self.tunnel(host, to_host, ports)
         # for both engines and notebooks, some might share a filesystem with
         # the controller, so to avoid connection file clashes, start the
         # controller's first, then those on each host in turn
-        # engines
-        done = {}
-        for host in component_hns[ENGINE]:
+        for host in hostnames:
+            # engines
+            done = {}
             for engine, num in engines.iteritems():
                 e_host, e_profile = self.host(engine)
                 if e_host != host:
@@ -214,28 +238,28 @@ configuration file.
                 self.copy_con_file(c_host, c_profile, e_host, e_profile,
                                    ENGINE)
                 for i in xrange(num):
-                    n = done.get((e_host, e_profile), 0)
+                    n = done.get(e_profile, 0)
                     cmd = ('ipengine', '--profile=%s' % e_profile)
                     ident = '%s-engine-%s' % (e_profile, n + i)
                     self.run_on(e_host, cmd, ident)
-                done[(e_host, e_profile)] = num
-        # notebooks
-        done = {}
-        for host in component_hns[CLIENT]:
+                done[e_profile] = num
+            # notebooks
+            done = {}
             for notebook in notebooks:
-                n_host, n_port, n_profile, opts = self.host(notebook, True)
+                n_host, n_port, n_profile, opts = self.host(notebook, 'nb')[:4]
                 if n_host != host:
                     continue
                 self.copy_con_file(c_host, c_profile, n_host, n_profile,
                                    CLIENT)
                 opts = [str(o) for o in opts]
                 if n_host != 'localhost':
+                    # running remotely, so running a browser is silly
                     opts.append('--no-browser')
                 cmd = ['ipython', 'notebook', '--profile=%s' % n_profile,
                        '--port=%s' % n_port] + opts
-                i = done.get((n_host, n_profile), 0)
+                i = done.get(n_profile, 0)
                 self.run_on(n_host, cmd, '%s-notebook-%s' % (n_profile, i))
-                done[(n_host, n_profile)] = i + 1
+                done[n_profile] = i + 1
 
     def wait (self):
         """Do nothing until the launcher is stopped or a subprocess dies."""
@@ -318,13 +342,15 @@ process.
             nice_s = s.replace('%', '%%').replace('\0', '%')
             nice_data.append(nice_s.replace('#', '##').replace('/', '#'))
         ident = '-'.join(nice_data)
-        log_file = '%s-%s-%s.log' % (self.log_prefix, ident, '%s')
+        log_file = '%s-%s-%s' % (self.log_prefix, ident, '%s')
         fs = [log_file % 'stdout', log_file % 'stderr']
         exists = os.path.exists
-        while exists(fs[0]) or exists(fs[1]):
+        while exists(fs[0] + '.log') or exists(fs[1] + '.log'):
             fs[0] += '_'
             fs[1] += '_'
             ident += '_'
+        fs[0] += '.log'
+        fs[1] += '.log'
         return (fs, ident)
 
     def run_cmd (self, cmd, log_files, ident, wait):
@@ -384,11 +410,11 @@ Returns the (stdout, stderr) log files written to.
         self.run_cmd(cmd, log_files, ident, wait)
         return log_files
 
-    def tunnel (self, host_from, host_to, ports):
+    def tunnel (self, host_on, host_to, ports):
         """Open an SSH tunnel between two hosts to forward some ports."""
         port_opts = ['-L%s:localhost:%s' % p for p in ports]
         # this will ssh to host_from first, if necessary
-        self.run_on(host_from, ['ssh', host_to, '-N'] + port_opts,
+        self.run_on(host_on, ['ssh', host_to, '-N'] + port_opts,
                     'forward-port')
 
     def get_output (self, host, cmd, ident):
@@ -486,12 +512,15 @@ Returns the (stdout, stderr) log files written to.
         except OSError:
             pass
 
-    def host (self, host, notebook = False):
+    def host (self, host, component = None):
         """Parse configuration host object and register aliases."""
-        types = {'port': int, 'options': list}
-        defaults = {'port': 8888, 'profile': 'default', 'options': []}
-        if notebook:
-            fields = ['port', 'profile', 'options']
+        types = {'port': int, 'options': list, 'clients': list}
+        defaults = {'port': 8888, 'profile': 'default', 'options': [],
+                    'clients': []}
+        if component == 'nb':
+            fields = ['port', 'profile', 'options', 'clients']
+        elif component == 'nbclient':
+            fields = ['port']
         else:
             fields = ['profile']
         fields.insert(0, 'host')
@@ -597,9 +626,9 @@ list: just a list of port numbers.
 
 """
         if format == 'confile' and types not in (ENGINE, CLIENT):
-            raise ValueError('confile format requires one type')
+            raise ValueError('\'confile\' format requires only one component')
         elif format == 'cmdline' and not (ALL & types == ALL):
-            raise ValueError('cmdline format requires all types')
+            raise ValueError('\'cmdline\' format requires all components')
         ports = self.ports.setdefault(host, {})
         # get used ports and number of needed ports
         used = []
@@ -616,7 +645,7 @@ list: just a list of port numbers.
                         used.append(p)
         # get needed ports
         if need > 0:
-            used += self._used_ports.get(host, set())
+            used += self._used_ports.get(host, [])
             if types == ENGINE:
                 ident = 'get-ports-engine'
             elif types == CLIENT:

@@ -5,7 +5,6 @@
 # - handle user@host-style hostnames
 # - configurable ip* paths - in config, per-host: have "paths": {HOST: [...]}
 # - --log-dir/--preserve-logs options
-# - --debug option
 # - wait for engines/notebooks on each host in turn to start before moving to next host
 # - check for asking for fingerprint confirmation
 # - check for asking for password
@@ -111,9 +110,9 @@ ERR_CONF = 1
 ERR_EXEC = 2
 ERR_IO = 3
 
-DEBUG = False
 LOG_DIR = os.getcwd()
 PRESERVE_LOGS = False
+DEBUG = False
 WAIT_TO_KILL = 5
 ENGINE = 1
 CLIENT = 2
@@ -150,6 +149,7 @@ class Launcher:
         self.open_fs = []
         self.stopping = False
         self._stopped = True
+        self._starting = False
         # add localhost so that we don't ssh to aliases for it to check their
         # IPs
         self.host('localhost')
@@ -281,6 +281,8 @@ configuration file.
 
     def stop (self, *args):
         """Stop all subprocesses."""
+        while self._starting:
+            sleep(.1)
         if self.stopping or self._stopped:
             return
         print 'stopping processes...'
@@ -356,7 +358,6 @@ process.
     def run_cmd (self, cmd, log_files, ident, wait):
         """Run a command and direct its output to log files."""
         printable_cmd = ' '.join(quote(arg) for arg in cmd)
-        print '[start]', ident
         if DEBUG:
             print printable_cmd
         # open log files
@@ -373,16 +374,18 @@ process.
                 fs.append(f)
                 self.open_fs.append(f)
         # run command
+        if self.stopping or self._stopped:
+            exit(0)
+        print '[start]', ident
+        self._starting = True
         try:
             p = Popen(cmd, stdin = PIPE, stdout = fs[0], stderr = fs[1])
         except OSError:
-            # might have failed because we're stopping
-            if self.stopping or self._stopped:
-                exit(0)
-            else:
-                self.bail_out('couldn\'t run command: \'%s\'' % printable_cmd,
-                              ERR_EXEC)
+            self._starting = False
+            self.bail_out('couldn\'t run command: \'%s\'' % printable_cmd,
+                          ERR_EXEC)
         self.processes.append((ident, p, wait))
+        self._starting = False
         if wait:
             try:
                 ret = p.wait()
@@ -391,7 +394,6 @@ process.
                 exit(0)
             for f in fs:
                 f.close()
-            # might have returned because we're stopping
             if self.stopping or self._stopped:
                 exit(0)
             elif ret != 0:
@@ -410,13 +412,6 @@ Returns the (stdout, stderr) log files written to.
         self.run_cmd(cmd, log_files, ident, wait)
         return log_files
 
-    def tunnel (self, host_on, host_to, ports):
-        """Open an SSH tunnel between two hosts to forward some ports."""
-        port_opts = ['-L%s:localhost:%s' % p for p in ports]
-        # this will ssh to host_from first, if necessary
-        self.run_on(host_on, ['ssh', host_to, '-N'] + port_opts,
-                    'forward-port')
-
     def get_output (self, host, cmd, ident):
         """Run a command and return its stdout."""
         log_files = self.run_on(host, cmd, ident, True)
@@ -428,6 +423,13 @@ Returns the (stdout, stderr) log files written to.
             self.bail_out(msg % log_files[0], ERR_IO)
         else:
             return out
+
+    def tunnel (self, host_on, host_to, ports):
+        """Open an SSH tunnel between two hosts to forward some ports."""
+        port_opts = ['-L%s:localhost:%s' % p for p in ports]
+        # this will ssh to host_from first, if necessary
+        self.run_on(host_on, ['ssh', host_to, '-N'] + port_opts,
+                    'forward-port')
 
     def get_profile_dir (self, host, profile):
         """Get the directory of an IPython profile on the given host."""

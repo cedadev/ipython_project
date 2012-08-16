@@ -1,30 +1,19 @@
 #! /usr/bin/env python
 
-# NOTE:
-# - need to have used SSH between hosts before, so that fingerprint has been accepted
-# - controller must be on a host to which SSH connections are passwordless
-# - shell config files mustn't print anything to stdout
-# - runs Python as 'python' everywhere
-# - hosts in config are as known by SSH from this machine
-# - get _lots_ of log files
-
 # TODO:
-# - don't clobber existing files with logs
-# - configurable ip* paths - in config, per-host: have "host_options": {HOST: {...}}
-# - better errors
-# - maybe run ipengine instead of ipcluster so we can use --ssh and track each individually - but then we have more local ssh processes
-# - can set client/engine ports for manual forwarding?
-# - --log-dir/--no-log options (need to keep some in pipes for reading, rest > /dev/null)
-# - check for asking for password
-# - check for asking for fingerprint confirmation
-# - check for stalled engines
-# - restart processes if they die?  Careful of changed connection files
-# - initial notebook dir
-# - careful with log file names with multiple nb/engine definitions on same host
 # - handle user@host-style hostnames
 # - don't let given notebook ports be used in tunneling
+# - configurable ip* paths - in config, per-host: have "paths": {HOST: [...]}
+# - don't clobber existing files with logs
+# - can set client/engine ports for manual forwarding?
 # - check for notebooks on the same host using the same port
+# - --log-dir/--no-log options (need to keep some in pipes for reading, rest > /dev/null)
+# - --debug option
+# - check for asking for fingerprint confirmation
+# - check for asking for password
 # - scary warning on connect
+# - check for stalled engines
+# - restart processes if they die?  Careful of changed connection files
 
 from sys import argv, exit
 from time import strftime, sleep
@@ -119,7 +108,7 @@ ERR_CONF = 1
 ERR_EXEC = 2
 ERR_IO = 3
 
-
+DEBUG = False
 WAIT_TO_KILL = 5
 PORTS = {'regport': 0, 'control': (7, 1), 'hb': (2, 3), 'iopub': (8, 4),
          'mux': (9, 5), 'task': (10, 6)}
@@ -158,6 +147,7 @@ configuration file.
         if not self._stopped:
             raise RuntimeError('already running: can\'t launch again')
         self._stopped = False
+        self._has_con_file = {'engine': [], 'client': []}
         # controller
         c_host, c_profile = self.host(controller)
         # pass options for ports so we know what they are
@@ -190,26 +180,28 @@ configuration file.
                 ports = c_ports
             self.tunnel(host, c_host, ports)
         # engines
+        done = {}
         for engine, num in engines.iteritems():
             e_host, e_profile = self.host(engine)
-            if (e_host, e_profile) != (c_host, c_profile):
-                self.copy_con_file(c_host, c_profile, e_host, e_profile,
-                                   'engine')
+            self.copy_con_file(c_host, c_profile, e_host, e_profile, 'engine')
             for i in xrange(num):
+                n = done.get((e_host, e_profile), 0)
                 self.run_on(e_host, ('ipengine', '--profile=%s' % e_profile),
-                            role = 'engine-%s' % i)
+                            '%s-engine-%s' % (e_profile, n + i))
+            done[(e_host, e_profile)] = num
         # notebooks
+        done = {}
         for notebook in notebooks:
             n_host, n_port, n_profile, opts = self.host(notebook, True)
-            if (n_host, n_profile) != (c_host, c_profile):
-                self.copy_con_file(c_host, c_profile, n_host, n_profile,
-                                   'client')
+            self.copy_con_file(c_host, c_profile, n_host, n_profile, 'client')
             opts = [str(o) for o in opts]
-            if n_host == 'localhost':
+            if n_host != 'localhost':
                 opts.append('--no-browser')
             cmd = ['ipython', 'notebook', '--profile=%s' % n_profile,
                    '--port=%s' % n_port] + opts
-            self.run_on(n_host, cmd, 'notebook')
+            i = done.get((n_host, n_profile), 0)
+            self.run_on(n_host, cmd, '%s-notebook-%s' % (n_profile, i))
+            done[(n_host, n_profile)] = i + 1
 
     def wait (self):
         """Do nothing until the launcher is stopped or a subprocess dies."""
@@ -225,8 +217,8 @@ configuration file.
             # or any subprocesses have stopped
             finished = [i for p, fs, i in ps if p.poll() is not None]
             if finished:
-                self.bail_out('one or more processes died or was killed:\n' + \
-                              '\n'.join(finished), ERR_EXEC)
+                msg = 'one or more processes died or was killed:\n\t'
+                self.bail_out(msg + '\n\t'.join(finished), ERR_EXEC)
             sleep(1)
 
     def stop (self, *args):
@@ -239,7 +231,7 @@ configuration file.
         processes = self.processes
         for p, fs, i in processes:
             if p.poll() is None:
-                print 'stop', i
+                print '[stop]', i
                 try:
                     p.terminate()
                 except OSError:
@@ -255,7 +247,7 @@ configuration file.
         for p, fs, i in processes:
             # resort to KILL for still-running processes
             if p.poll() is None:
-                print 'kill', i
+                print '[kill]', i
                 try:
                     p.kill()
                 except OSError:
@@ -294,7 +286,9 @@ process.
     def run_cmd (self, cmd, log_files, ident, wait):
         """Run a command and direct its output to log files."""
         printable_cmd = ' '.join(quote(arg) for arg in cmd)
-        print printable_cmd
+        print '[start]', ident
+        if DEBUG:
+            print printable_cmd
         # open log files
         fs = []
         for fn in log_files:
@@ -376,10 +370,19 @@ Returns the (stdout, stderr) log files written to.
                        ident):
         """Copy a connection file between hosts.
 
-Returns the (stdout, stderr) log files written to.
+If the copy was made, returns the (stdout, stderr) log files written to (else
+it was unnecessary, and the return value is None).
 
 """
-        log_files, p_ident = self.log_files(host_from, host_to, 'copy', ident)
+        # check if don't need to copy
+        if (host_from, profile_from) == (host_to, profile_to):
+            return
+        # should only ever need to copy to each host once
+        if (host_to, profile_to) in self._has_con_file[ident]:
+            return
+        self._has_con_file[ident].append((host_to, profile_to))
+        log_files, p_ident = self.log_files(host_from, host_to, 'copy',
+                                            profile_to, ident)
         # get file paths
         f_from = self.get_profile_dir(host_from, profile_from)
         f_from = '%s/security/ipcontroller-%s.json' % (f_from, ident)

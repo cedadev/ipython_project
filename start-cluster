@@ -4,13 +4,11 @@
 # - make valid in Python 2.5/version check
 # - handle user@host-style hostnames
 # - configurable ip* paths - in config, per-host: have "paths": {HOST: [...]}
-# - don't clobber existing files with logs
-# - --log-dir/--no-log options (need to keep some in pipes for reading, rest > /dev/null)
+# - --log-dir/--preserve-logs options
 # - --debug option
 # - wait for engines/notebooks on each host in turn to start before moving to next host
 # - check for asking for fingerprint confirmation
 # - check for asking for password
-# - scary warning on connect
 # - check for stalled engines
 # - restart processes if they die?  Careful of changed connection files
 
@@ -95,10 +93,10 @@ Known issues:
    print anything to stdout.
  - python, ipython, ipcontroller and ipengine are assumed to be on the path
    where they are used (python and ipython on every host).
- - You can end up with a /lot/ of log files.
+ - A /lot/ of log files are created in the working directory while running.
 
-To stop this script and all running components, send one of SIGINT, SIGTERM or
-SIGHUP (or ctrl-C).
+To stop this script and all running components, send one of SIGINT (ctrl-C),
+SIGTERM or SIGHUP.
 
 The exit status in the case of an error is:
     1: invalid configuration file
@@ -111,6 +109,8 @@ ERR_EXEC = 2
 ERR_IO = 3
 
 DEBUG = False
+LOG_DIR = os.getcwd()
+PRESERVE_LOGS = False
 WAIT_TO_KILL = 5
 ENGINE = 1
 CLIENT = 2
@@ -144,6 +144,7 @@ class Launcher:
         self.ports = {}
         self.ipy_dirs = {}
         self.processes = []
+        self.open_fs = []
         self.stopping = False
         self._stopped = True
         # add localhost so that we don't ssh to aliases for it to check their
@@ -248,7 +249,7 @@ configuration file.
             if not ps:
                 err('no processes running: stopping...', ERR_EXEC)
             # or any subprocesses have stopped
-            finished = [i for p, fs, i in ps if p.poll() is not None]
+            finished = [i for i, p, w in ps if not w and p.poll() is not None]
             if finished:
                 msg = 'one or more processes died or was killed:\n\t'
                 self.bail_out(msg + '\n\t'.join(finished), ERR_EXEC)
@@ -261,8 +262,8 @@ configuration file.
         print 'stopping processes...'
         self.stopping = True
         # try TERM
-        processes = self.processes
-        for p, fs, i in processes:
+        ps = self.processes
+        for i, p, w in ps:
             if p.poll() is None:
                 print '[stop]', i
                 try:
@@ -272,13 +273,12 @@ configuration file.
                     pass
         # wait for a while
         for j in xrange(int(WAIT_TO_KILL / .1)):
-            if any(p.poll() is None for p, fs, i in processes):
+            if any(p.poll() is None for i, p, w in ps):
                 sleep(.1)
             else:
                 break
-        # clean up
-        for p, fs, i in processes:
-            # resort to KILL for still-running processes
+        # resort to KILL for still-running processes
+        for i, p, w in ps:
             if p.poll() is None:
                 print '[kill]', i
                 try:
@@ -286,9 +286,14 @@ configuration file.
                 except OSError:
                     # already finished
                     pass
-            # close log files
-            for f in fs:
-                f.close()
+        # close/delete log files
+        for f in self.open_fs:
+            f.close()
+            if not PRESERVE_LOGS:
+                try:
+                    os.remove(f.name)
+                except OSError:
+                    pass
         self.stopping = False
         self._stopped = True
 
@@ -314,7 +319,13 @@ process.
             nice_data.append(nice_s.replace('#', '##').replace('/', '#'))
         ident = '-'.join(nice_data)
         log_file = '%s-%s-%s.log' % (self.log_prefix, ident, '%s')
-        return ((log_file % 'stdout', log_file % 'stderr'), ident)
+        fs = [log_file % 'stdout', log_file % 'stderr']
+        exists = os.path.exists
+        while exists(fs[0]) or exists(fs[1]):
+            fs[0] += '_'
+            fs[1] += '_'
+            ident += '_'
+        return (fs, ident)
 
     def run_cmd (self, cmd, log_files, ident, wait):
         """Run a command and direct its output to log files."""
@@ -334,6 +345,7 @@ process.
                 self.bail_out(msg % fn, ERR_IO)
             else:
                 fs.append(f)
+                self.open_fs.append(f)
         # run command
         try:
             p = Popen(cmd, stdin = PIPE, stdout = fs[0], stderr = fs[1])
@@ -344,17 +356,21 @@ process.
             else:
                 self.bail_out('couldn\'t run command: \'%s\'' % printable_cmd,
                               ERR_EXEC)
+        self.processes.append((ident, p, wait))
         if wait:
-            ret = p.wait()
-            f.close()
-            # might have failed because we're stopping
+            try:
+                ret = p.wait()
+            except OSError:
+                # can only happen if stopped (by Launcher.stop)
+                exit(0)
+            for f in fs:
+                f.close()
+            # might have returned because we're stopping
             if self.stopping or self._stopped:
                 exit(0)
             elif ret != 0:
                 msg = 'command returned non-zero exit status (%s): \'%s\''
                 self.bail_out(msg % (ret, printable_cmd), ERR_EXEC)
-        else:
-            self.processes.append((p, fs, ident))
 
     def run_on (self, host, cmd, ident, wait = False):
         """Run a command on the given host over SSH.

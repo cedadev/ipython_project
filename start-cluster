@@ -4,16 +4,16 @@
 # - make valid in Python 2.5/version check
 # - handle user@host-style hostnames
 # - configurable ip* paths - in config, per-host: have "paths": {HOST: [...]}
-# - --log-dir/--preserve-logs options
 # - wait for engines/notebooks on each host in turn to start before moving to next host
 # - check for asking for fingerprint confirmation
 # - check for asking for password
 # - check for stalled engines
 # - restart processes if they die?  Careful of changed connection files
 
-from sys import argv, exit
+from sys import exit
 from time import strftime, sleep
 from signal import signal, SIGINT, SIGTERM, SIGHUP
+import optparse
 import os
 from tempfile import mkstemp
 from shutil import copyfile
@@ -23,9 +23,8 @@ import socket
 import json
 from pipes import quote
 
-
-HELP = '''Usage: start-cluster CONFIG_FILE
-
+USAGE = '%prog [OPTIONS] CONFIG_FILE'
+HELP = '''
 This script starts an IPython cluster across multiple machines according to the
 configuration file CONFIG_FILE.  This is a JSON file containing a dict with
 keys:
@@ -105,13 +104,11 @@ The exit status in the case of an error is:
     2: couldn't execute a command
     3: local I/O error'''
 
-
 ERR_CONF = 1
-ERR_EXEC = 2
-ERR_IO = 3
+ERR_ARGS = 2 # optparse uses this
+ERR_EXEC = 3
+ERR_IO = 4
 
-LOG_DIR = os.getcwd()
-PRESERVE_LOGS = False
 DEBUG = False
 WAIT_TO_KILL = 5
 ENGINE = 1
@@ -129,19 +126,25 @@ PORTS = {
 }
 
 
-
-
 def err (msg, code):
     """Print an error message and exit."""
     print 'error:', msg
     exit(code)
 
 
+class PreformattedFormatter (optparse.IndentedHelpFormatter):
+    """optparse text formatter for preformatted description text."""
+
+    def format_description (self, desc):
+        return desc.rstrip().lstrip('\n\r') + '\n'
+
+
 class Launcher:
     """Handles starting up a cluster over SSH, including forwarding ports."""
 
-    def __init__ (self):
-        self.log_prefix = strftime('%F-%T')
+    def __init__ (self, log_dir, preserve_logs):
+        self.log_prefix = os.path.join(log_dir, strftime('%F-%T'))
+        self.preserve_logs = preserve_logs
         self.hosts = {}
         self.ports = {}
         self.ipy_dirs = {}
@@ -313,9 +316,10 @@ configuration file.
                     # already finished
                     pass
         # close/delete log files
+        delete = not self.preserve_logs
         for f in self.open_fs:
             f.close()
-            if not PRESERVE_LOGS:
+            if delete:
                 try:
                     os.remove(f.name)
                 except OSError:
@@ -694,11 +698,21 @@ list: just a list of port numbers.
 
 
 if __name__ == '__main__':
-    if len(argv) < 2 or argv[0] in ('-h', '--help'):
-        print HELP
+    op = optparse.OptionParser(usage = USAGE, description = HELP,
+                               formatter = PreformattedFormatter())
+    op.add_option('-d', '--log-dir', action = 'store', type = 'string',
+                  default = os.getcwd(),
+                  help = 'directory to use for log files (this is not ' \
+                         'created)')
+    op.add_option('-p', '--preserve-logs', action = 'store_true',
+                  default = False,
+                  help = 'whether to skip deleting log files when exiting')
+    options, args = op.parse_args()
+    if not args:
+        op.print_help()
         exit(0)
     # load configuration file
-    config = argv[1]
+    config = args[0]
     try:
         with open(config) as f:
             config = json.load(f)
@@ -715,7 +729,7 @@ if __name__ == '__main__':
     if not isinstance(notebooks, list):
         err('invalid configuration file: notebooks must be a list', ERR_CONF)
     # start launcher
-    l = Launcher()
+    l = Launcher(options.log_dir, options.preserve_logs)
     for sig in (SIGINT, SIGTERM, SIGHUP):
         signal(sig, l.stop)
     l.launch(config['controller'], engines, notebooks)

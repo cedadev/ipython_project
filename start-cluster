@@ -1,12 +1,13 @@
 #! /usr/bin/env python
 
 # TODO:
+# - make valid in Python 2.5/version check
 # - handle user@host-style hostnames
 # - configurable ip* paths - in config, per-host: have "paths": {HOST: [...]}
 # - don't clobber existing files with logs
-# - can set client/engine ports for manual forwarding?
 # - --log-dir/--no-log options (need to keep some in pipes for reading, rest > /dev/null)
 # - --debug option
+# - wait for engines/notebooks on each host in turn to start before moving to next host
 # - check for asking for fingerprint confirmation
 # - check for asking for password
 # - scary warning on connect
@@ -16,6 +17,9 @@
 from sys import argv, exit
 from time import strftime, sleep
 from signal import signal, SIGINT, SIGTERM, SIGHUP
+import os
+from tempfile import mkstemp
+from shutil import copyfile
 from subprocess import Popen, PIPE
 import shlex
 import socket
@@ -106,10 +110,23 @@ ERR_CONF = 1
 ERR_EXEC = 2
 ERR_IO = 3
 
-DEBUG = True
+DEBUG = False
 WAIT_TO_KILL = 5
-PORTS = {'regport': 0, 'control': (7, 1), 'hb': (2, 3), 'iopub': (8, 4),
-         'mux': (9, 5), 'task': (10, 6)}
+ENGINE = 1
+CLIENT = 2
+ALL = ENGINE | CLIENT
+IDENT_TO_STR = {ENGINE: 'engine', CLIENT: 'client', ALL: 'all'}
+PORTS = {
+    'control': ((CLIENT, 'control'), (ENGINE, 'control')),
+    'task': ((CLIENT, 'task'), (ENGINE, 'task')),
+    'mux': ((CLIENT, 'mux'), (ENGINE, 'mux')),
+    'regport': ((ALL, 'registration'),),
+    'iopub': ((CLIENT, 'iopub'), (ENGINE, 'iopub')),
+    'hb': ((ENGINE, 'hb_ping'), (ENGINE, 'hb_pong')),
+    'notifier_port': ((CLIENT, 'notification'),)
+}
+
+
 
 
 def err (msg, code):
@@ -145,71 +162,79 @@ configuration file.
         if not self._stopped:
             raise RuntimeError('already running: can\'t launch again')
         self._stopped = False
-        self._has_con_file = {'engine': [], 'client': []}
+        self._has_con_file = {ENGINE: [], CLIENT: []}
         c_host, c_profile = self.host(controller)
-        # get hosts that will connect to controller, and notebook ports
+        # get hosts that will connect to controller, sort by host, and disallow
+        # using notebook ports for controller connections
         connecting_hosts = {}
-        n_ports = []
-        for is_notebook, hosts in enumerate((engines, notebooks)):
+        component_hns = {}
+        self._used_ports = used_ports = {}
+        for t, hosts in ((ENGINE, engines), (CLIENT, notebooks)):
+            is_notebook = t == CLIENT
+            hns = []
             for host in hosts:
                 data = self.host(host, is_notebook)
                 host = data[0]
+                hns.append(host)
                 if is_notebook:
                     # add notebook port to list, and check for conflicts
-                    port_data = (data[1], host)
-                    if port_data in n_ports:
+                    port = data[1]
+                    this_used = used_ports.setdefault(host, set())
+                    if port in this_used:
                         msg = 'multiple notebooks are using port %s on %s'
-                        self.bail_out(msg % port_data, ERR_CONF)
-                    n_ports.append(port_data)
+                        self.bail_out(msg % (port, host), ERR_CONF)
+                    this_used.add(port)
                 if host != c_host:
-                    n = 2 if is_notebook else 1
-                    connecting_hosts[host] = connecting_hosts.get(host, 0) | n
-        # disallow using notebook ports for controller
-        self._used_ports = list(set([p for p, h in n_ports]))
+                    connecting_hosts[host] = connecting_hosts.get(host, 0) | t
+            component_hns[t] = list(set(hns))
+            # make connection host first, if present
+            if c_host in hns:
+                hns.insert(0, hns.pop(hns.index(c_host)))
         # controller: pass options for ports so we know what they are
-        c_ports = self.get_ports(c_host, 'all')
-        e_ports = self.get_ports(c_host, 'engine')
-        cl_ports = self.get_ports(c_host, 'client')
-        port_opts = []
-        for ident, js in PORTS.iteritems():
-            if isinstance(js, int):
-                js = (js,)
-            ports = ','.join(str(c_ports[j]) for j in js)
-            port_opts.append('--HubFactory.%s=%s' % (ident, ports))
+        port_opts = self.get_ports(c_host, ALL, 'cmdline')
         cmd = ['ipcontroller', '--profile=%s' % c_profile] + port_opts
         self.run_on(c_host, cmd, 'controller')
         # forward ports
+        c_ports = self.get_ports(c_host, ALL, 'ident')
         for host, types in connecting_hosts.iteritems():
-            if types == 1:
-                ports = e_ports
-            elif types == 2:
-                ports = cl_ports
-            else: # types == 3
-                ports = c_ports
+            ports = self.get_ports(host, types, 'ident')
+            ports = [(ports[ident], c_ports[ident]) for ident in ports]
             self.tunnel(host, c_host, ports)
+        # for both engines and notebooks, some might share a filesystem with
+        # the controller, so to avoid connection file clashes, start the
+        # controller's first, then those on each host in turn
         # engines
         done = {}
-        for engine, num in engines.iteritems():
-            e_host, e_profile = self.host(engine)
-            self.copy_con_file(c_host, c_profile, e_host, e_profile, 'engine')
-            for i in xrange(num):
-                n = done.get((e_host, e_profile), 0)
-                self.run_on(e_host, ('ipengine', '--profile=%s' % e_profile),
-                            '%s-engine-%s' % (e_profile, n + i))
-            done[(e_host, e_profile)] = num
+        for host in component_hns[ENGINE]:
+            for engine, num in engines.iteritems():
+                e_host, e_profile = self.host(engine)
+                if e_host != host:
+                    continue
+                self.copy_con_file(c_host, c_profile, e_host, e_profile,
+                                   ENGINE)
+                for i in xrange(num):
+                    n = done.get((e_host, e_profile), 0)
+                    cmd = ('ipengine', '--profile=%s' % e_profile)
+                    ident = '%s-engine-%s' % (e_profile, n + i)
+                    self.run_on(e_host, cmd, ident)
+                done[(e_host, e_profile)] = num
         # notebooks
         done = {}
-        for notebook in notebooks:
-            n_host, n_port, n_profile, opts = self.host(notebook, True)
-            self.copy_con_file(c_host, c_profile, n_host, n_profile, 'client')
-            opts = [str(o) for o in opts]
-            if n_host != 'localhost':
-                opts.append('--no-browser')
-            cmd = ['ipython', 'notebook', '--profile=%s' % n_profile,
-                   '--port=%s' % n_port] + opts
-            i = done.get((n_host, n_profile), 0)
-            self.run_on(n_host, cmd, '%s-notebook-%s' % (n_profile, i))
-            done[(n_host, n_profile)] = i + 1
+        for host in component_hns[CLIENT]:
+            for notebook in notebooks:
+                n_host, n_port, n_profile, opts = self.host(notebook, True)
+                if n_host != host:
+                    continue
+                self.copy_con_file(c_host, c_profile, n_host, n_profile,
+                                   CLIENT)
+                opts = [str(o) for o in opts]
+                if n_host != 'localhost':
+                    opts.append('--no-browser')
+                cmd = ['ipython', 'notebook', '--profile=%s' % n_profile,
+                       '--port=%s' % n_port] + opts
+                i = done.get((n_host, n_profile), 0)
+                self.run_on(n_host, cmd, '%s-notebook-%s' % (n_profile, i))
+                done[(n_host, n_profile)] = i + 1
 
     def wait (self):
         """Do nothing until the launcher is stopped or a subprocess dies."""
@@ -331,13 +356,13 @@ process.
         else:
             self.processes.append((p, fs, ident))
 
-    def run_on (self, host, cmd, role, wait = False):
+    def run_on (self, host, cmd, ident, wait = False):
         """Run a command on the given host over SSH.
 
 Returns the (stdout, stderr) log files written to.
 
 """
-        log_files, ident = self.log_files(host, role)
+        log_files, ident = self.log_files(host, ident)
         if host != 'localhost':
             cmd = ('ssh', '-tt', host, ' '.join(quote(arg) for arg in cmd))
         self.run_cmd(cmd, log_files, ident, wait)
@@ -345,14 +370,14 @@ Returns the (stdout, stderr) log files written to.
 
     def tunnel (self, host_from, host_to, ports):
         """Open an SSH tunnel between two hosts to forward some ports."""
-        port_opts = ['-L%s:localhost:%s' % (p, p) for p in ports]
+        port_opts = ['-L%s:localhost:%s' % p for p in ports]
         # this will ssh to host_from first, if necessary
         self.run_on(host_from, ['ssh', host_to, '-N'] + port_opts,
                     'forward-port')
 
-    def get_output (self, host, cmd, role):
+    def get_output (self, host, cmd, ident):
         """Run a command and return its stdout."""
-        log_files = self.run_on(host, cmd, role, True)
+        log_files = self.run_on(host, cmd, ident, True)
         try:
             with open(log_files[0]) as f:
                 out = f.read()
@@ -374,12 +399,28 @@ Returns the (stdout, stderr) log files written to.
             self.ipy_dirs[host] = ipy_dir
         return '%s/profile_%s' % (ipy_dir, profile)
 
+    def copy_file (self, host_from, f_from, host_to, f_to, ident):
+        """Copy a file between hosts."""
+        # construct hosts
+        if host_from != 'localhost':
+            f_from = ':'.join((host_from, f_from))
+        if host_to != 'localhost':
+            f_to = ':'.join((host_to, f_to))
+        if host_from == host_to == 'localhost':
+            # local copy
+            try:
+                copyfile(f_from, f_to)
+            except IOError:
+                msg = 'couldn\'t copy file: \'%s\' to \'%s\''
+                self.bail_out(msg % (f_from, f_to), ERR_IO)
+        else:
+            # copy over scp
+            log_files, ident = self.log_files(ident)
+            self.run_cmd(('scp', f_from, f_to), log_files, ident, True)
+
     def copy_con_file (self, host_from, profile_from, host_to, profile_to,
                        ident):
         """Copy a connection file between hosts.
-
-If the copy was made, returns the (stdout, stderr) log files written to (else
-it was unnecessary, and the return value is None).
 
 """
         # check if don't need to copy
@@ -389,24 +430,45 @@ it was unnecessary, and the return value is None).
         if (host_to, profile_to) in self._has_con_file[ident]:
             return
         self._has_con_file[ident].append((host_to, profile_to))
-        log_files, p_ident = self.log_files(host_from, host_to, 'copy',
-                                            profile_to, ident)
+        s_ident = IDENT_TO_STR[ident]
         # get file paths
         f_from = self.get_profile_dir(host_from, profile_from)
-        f_from = '%s/security/ipcontroller-%s.json' % (f_from, ident)
+        f_from = '%s/security/ipcontroller-%s.json' % (f_from, s_ident)
         f_to = self.get_profile_dir(host_to, profile_to)
-        f_to = '%s/security/ipcontroller-%s.json' % (f_to, ident)
-        # construct hosts for scp
-        if host_from == 'localhost':
-            host_from = f_from
-        else:
-            host_from = ':'.join((host_from, f_from))
-        if host_to == 'localhost':
-            host_to = f_to
-        else:
-            host_to = ':'.join((host_to, f_to))
-        self.run_cmd(('scp', host_from, host_to), log_files, p_ident, True)
-        return log_files
+        f_to = '%s/security/ipcontroller-%s.json' % (f_to, s_ident)
+        # first copy to local temp file
+        desc, f_temp = mkstemp()
+        try:
+            os.close(desc)
+        except OSError:
+            pass
+        this_ident = '-'.join((host_from, 'getcon', profile_from, s_ident))
+        self.copy_file(host_from, f_from, 'localhost', f_temp, this_ident)
+        # edit with ports
+        ports = self.get_ports(host_to, ident, 'confile')
+        try:
+            with open(f_temp) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError()
+        except (IOError, ValueError):
+            self.bail_out('couldn\'t read from file: \'%s\'' % f_temp, ERR_IO)
+        data.update(ports)
+        # stop scary warning about not being at location
+        data['location'] = '127.0.0.1'
+        try:
+            with open(f_temp, 'w') as f:
+                json.dump(data, f, indent = 4)
+        except IOError:
+            self.bail_out('couldn\'t write to file: \'%s\'' % f_temp, ERR_IO)
+        # copy to destination
+        this_ident = '-'.join((host_to, 'setcon', profile_to, s_ident))
+        self.copy_file('localhost', f_temp, host_to, f_to, this_ident)
+        # clean up
+        try:
+            os.remove(f_temp)
+        except OSError:
+            pass
 
     def host (self, host, notebook = False):
         """Parse configuration host object and register aliases."""
@@ -480,65 +542,108 @@ print '\\n'.join([name] + names + ips)
         data[0] = host
         return data
 
-    def get_ports (self, host, which):
-        """Get and store a list of suitable ports on the given host."""
-        if which == 'all':
-            need = 11
-        elif which == 'engine':
-            need = 7
-        elif which == 'client':
-            need = 5
-        else:
-            raise ValueError('invalid which argument')
-        ports = self.ports.setdefault(host, [])
-        got = len(ports)
-        real_which = which
-        # retrieve from cache if available
-        if got == need:
-            return ports
-        elif got == 11: # which != 'all'
-            if which == 'engine':
-                return ports[:7]
-            else: # which == 'client'
-                return ports[:1] + ports[7:11]
-        elif got > 0:
-            if which == 'all':
-                need -= got
-                which = 'engine' if got == 5 else 'client'
-            else:
-                need -= 1
-        # generate port list
-        used_ports = ports + self._used_ports
+    def _get_ports (self, host, num, used_ports, ident):
+        """Get a number of suitable ports on the given host."""
         core_code = '''
-new_ports = []
+ports = []
 for i in xrange(%s):
     while True:
         sock = socket.socket()
         sock.bind(('', 0))
         port = sock.getsockname()[1]
         sock.close()
-        if port not in new_ports and port not in used_ports:
-            new_ports.append(port)
+        if port not in ports and port not in used_ports:
+            ports.append(port)
             break
 '''
         if host == 'localhost':
-            exec(core_code % need)
+            exec(core_code % num)
         else:
-            new_ports = self.get_output(host, ('python', '-c', ('''
+            ports = self.get_output(host, ('python', '-c', ('''
 import socket
 used_ports = %s
 ''' + core_code + '''
-print '\\n'.join(str(p) for p in new_ports)
-''') % (repr(used_ports), need)), 'get-ports-' + which)
-            new_ports = [int(p.strip()) for p in new_ports.split('\n')
-                         if p.strip()]
-        # add to existing port list
-        if got == 0 or which == 'client':
-            ports += new_ports
-        else: # which == 'engine' (since if which == 'all', got == 0)
-            for port in new_ports:
-                ports.insert(1, port)
-        return self.get_ports(host, real_which)
+print '\\n'.join(str(p) for p in ports)
+''') % (repr(used_ports), num)), ident)
+            ports = [int(p.strip()) for p in ports.split('\n') if p.strip()]
+        return ports
+
+    def get_ports (self, host, types, format = None):
+        """Get, store and return a list of suitable ports on the given host.
+
+format is 'confile', 'cmdline', 'ident' or 'list'.
+
+confile: {key: port} as used in connection files.
+cmdline: list of controller command-line options.
+ident: {ident: port}, where ident is unique across all ports and calls for
+       different hosts will use the same ident for the 'same' ports.
+list: just a list of port numbers.
+
+"""
+        if format == 'confile' and types not in (ENGINE, CLIENT):
+            raise ValueError('confile format requires one type')
+        elif format == 'cmdline' and not (ALL & types == ALL):
+            raise ValueError('cmdline format requires all types')
+        ports = self.ports.setdefault(host, {})
+        # get used ports and number of needed ports
+        used = []
+        need = 0
+        for ident, defs in PORTS.iteritems():
+            ps = ports.setdefault(ident, [None] * len(defs))
+            for i, (t, name) in enumerate(defs):
+                if types & t:
+                    # want this port
+                    p = ps[i]
+                    if p is None:
+                        need += 1
+                    else:
+                        used.append(p)
+        # get needed ports
+        if need > 0:
+            used += self._used_ports.get(host, set())
+            if types == ENGINE:
+                ident = 'get-ports-engine'
+            elif types == CLIENT:
+                ident = 'get-ports-client'
+            else:
+                ident = 'get-ports-all'
+            new = self._get_ports(host, need, used, ident)
+        else:
+            new = []
+        # store and retrieve ports
+        wanted = {}
+        for ident, defs in PORTS.iteritems():
+            ps = ports[ident]
+            wanted_ps = []
+            for i, (t, name) in enumerate(defs):
+                if types & t:
+                    # want this port
+                    p = ps[i]
+                    if p is None:
+                        ps[i] = new.pop(0)
+                    wanted_ps.append((name, t, ps[i]))
+            if wanted_ps:
+                wanted[ident] = wanted_ps
+        # convert to desired format
+        if format == 'confile':
+            rtn = {}
+            for ps in wanted.itervalues():
+                for name, t, p in ps:
+                    rtn[name] = p
+        elif format == 'cmdline':
+            rtn = []
+            for ident, ps in wanted.iteritems():
+                ps = ','.join(str(p) for name, t, p in ps)
+                rtn.append('--HubFactory.%s=%s' % (ident, ps))
+        elif format == 'ident':
+            rtn = {}
+            for ident, ps in wanted.iteritems():
+                for name, t, p in ps:
+                    rtn[name + str(t)] = p
+        else: # format == 'list'
+            rtn = sum(([p for name, t, p in ps] for ps in wanted.itervalues()),
+                      [])
+        return rtn
 
 
 if __name__ == '__main__':

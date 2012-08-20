@@ -1,12 +1,35 @@
 """A module to compute the seasonal mean over a variable in a dataset.
 
-See the run function.
+See the run function.  time_bounds may also be useful.
 
 """
 
 from IPython.parallel import Client, interactive
 import numpy
 from netCDF4 import MFDataset, num2date
+
+
+def time_bounds (files, time_name = 'time'):
+    """Get first and last times, and length of time variable.
+
+time_bounds(files, time_name = 'time') -> (first, last, length)
+
+files: as taken by netCDF4.MFDataset.
+time_name: the name of the time variable; can actually be any one-dimensional
+           variable.
+
+Times are netCDF4.netcdftime.datetime objects.  If length is 0, times are None.
+
+"""
+    with MFDataset(files) as d:
+        t = d.variables[time_name]
+        l = len(t)
+        if l == 0:
+            times = (None, None)
+        else:
+            times = tuple(num2date((t[0], t[-1]), t.units, t.calendar))
+    return times + (l,)
+
 
 @interactive
 def _get_mean_worker (times):
@@ -18,6 +41,7 @@ def _get_mean_worker (times):
         arr = var[index]
         results.append(arr.mean(time_index))
     return numpy.array(results)
+
 
 def get_mean_serial (var, time_index, times):
     """Compute the seasonal mean.
@@ -39,6 +63,7 @@ results: the var array with time now in seasons.
         arr = var[index]
         results.append(arr.mean(time_index))
     return numpy.array(results)
+
 
 def get_mean_parallel (dv, var, time_index, times):
     """Compute the seasonal mean in parallel.
@@ -64,6 +89,7 @@ results: the var array with time now in seasons.
     dv.execute('del var, time_index')
     return results
 
+
 def run (files, var_name, start_year, start_month, end_year, parallel = True,
          season_length = 3, engines = None, var_path = '/', time_path = '/',
          time_name = 'time'):
@@ -82,8 +108,8 @@ parallel: whether to run the computation in parallel (using IPython.parallel).
 season_length: the length of a season in months.
 engines: a list of engines to use if running in parallel.  The default is to
          use all available engines.
-var_path, time_path: the path of the groups the temperature and time variables
-                     are in within the dataset.
+var_path, time_path: the path of the groups these variables are in within the
+                     dataset.
 time_name: the name of the time variable.  This can actually be any
            one-dimensional variable - it doesn't need to represent time.
 
@@ -98,13 +124,12 @@ results: the array for the var variable, with time now in seasons.
         dv.block = True
         dv.execute('import numpy')
 
-    d = MFDataset(files)
-    try:
+    with MFDataset(files) as d:
         # find variables
         vs = []
         for path, v_name in ((time_path, time_name), (var_path, var_name)):
             g = d
-            for g_name in path.strip('/').split(' /'):
+            for g_name in path.strip('/').split('/'):
                 if g_name:
                     g = g.groups[g_name]
             vs.append(g.variables[v_name])
@@ -153,6 +178,4 @@ results: the array for the var variable, with time now in seasons.
             results = get_mean_parallel(dv, var, time_index, time_indices)
         else:
             results = get_mean_serial(var, time_index, time_indices)
-    finally:
-        d.close()
     return results

@@ -1,12 +1,14 @@
 #! /usr/bin/env python
 
 # TODO:
+# - instead of ipython locate, do it manually (then can remove note on needing ipython everywhere)
 # - make valid in Python 2.5/version check
 # - handle user@host-style hostnames
 # - configurable ip* paths - in config, per-host: have "paths": {HOST: [...]}
-# - wait for engines/notebooks on each host in turn to start before moving to next host
+# - wait for engines/notebooks on each host in turn to start before moving to next host - in case they haven't loaded the connection file by the time we've changed it
 # - check for asking for fingerprint confirmation
 # - check for asking for password
+# - verbose option
 # - check for stalled engines
 # - restart processes if they die?  Careful of changed connection files
 
@@ -232,6 +234,8 @@ configuration file.
         # the controller, so to avoid connection file clashes, start the
         # controller's first, then those on each host in turn
         for host in hostnames:
+            print '[sleep] 1'
+            sleep(1)
             # engines
             done = {}
             for engine, num in engines.iteritems():
@@ -278,8 +282,8 @@ configuration file.
             # or any subprocesses have stopped
             finished = [i for i, p, w in ps if not w and p.poll() is not None]
             if finished:
-                msg = 'one or more processes died or was killed:\n\t'
-                self.bail_out(msg + '\n\t'.join(finished), ERR_EXEC)
+                msg = 'one or more processes died:\n\t' + '\n\t'.join(finished)
+                self.bail_out(msg, ERR_EXEC)
             sleep(1)
 
     def stop (self, *args):

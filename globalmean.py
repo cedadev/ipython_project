@@ -1,13 +1,8 @@
 """A module to compute the seasonal mean over a variable in a dataset.
 
-See the run function.
+See the run function.  time_bounds may also be useful.
 
 """
-
-# TODO:
-# - split_range doc
-# - time_bounds in module doc
-# - take n_at_once as arg
 
 from glob import glob
 
@@ -18,13 +13,44 @@ import cdms2
 
 
 def split_range (start, end, n_pieces):
+    """Split a range into the given number of pieces.
+
+split_range(start, end, n_pieces) -> list_of_ranges
+
+list_of_ranges is a list of (start, end) tuples, and the end and start of
+consecutive ranges are equal.
+
+"""
     n = end - start
     per_piece = float(n) / n_pieces
     pieces = [start + int(round(per_piece * i)) for i in xrange(n_pieces + 1)]
-    return [(pieces[i], pieces[i + 1]) for i in xrange(n_pieces)]
+    return [(pieces[i], pieces[i + 1])
+            for i in xrange(n_pieces) if pieces[i] < pieces[i + 1]]
 
 
-def get_mean_serial (files, start, end, var_names, wt):
+def time_bounds (files, time_name = 'time'):
+    """Get first and last times, and length of time variable.
+
+time_bounds(files, time_name = 'time') -> (first, last, length)
+
+files: as taken by netCDF4.MFDataset.
+time_name: the name of the time variable; can actually be any one-dimensional
+           variable.
+
+Times are netCDF4.netcdftime.datetime objects.  If length is 0, times are None.
+
+"""
+    with MFDataset(files) as d:
+        t = d.variables[time_name]
+        l = len(t)
+        if l == 0:
+            times = (None, None)
+        else:
+            times = tuple(num2date((t[0], t[-1]), t.units, t.calendar))
+    return times + (l,)
+
+
+def get_mean_serial (files, start, end, var_names, times_at_once, wt):
     """Compute the global mean.
 
 get_mean_serial(files, start, end, var_names, wt) -> results
@@ -51,8 +77,8 @@ results: the var array along time with each subarray its mean.
         data = []
         # do in time chunks
         n = end - start
-        n_at_once = 1000
-        times = split_range(start, end, n / n_at_once + bool(n % n_at_once))
+        n_pieces = n / times_at_once + bool(n % times_at_once)
+        times = split_range(start, end, n_pieces)
         for start, end in times:
             index[time_index] = slice(start, end)
             # get and transform data
@@ -69,7 +95,7 @@ results: the var array along time with each subarray its mean.
     return numpy.hstack(data)
 
 
-def get_mean_parallel (dv, files, start, end, var_names, wt):
+def get_mean_parallel (dv, files, start, end, var_names, times_at_once, wt):
     """Compute the seasonal mean in parallel.
 
 get_mean_serial(dv, files, start, end, var_names, wt) -> results
@@ -86,8 +112,8 @@ results: the var array along time with each subarray its mean.
     # split between engines
     times = split_range(start, end, len(dv.targets))
     dv.push({'get_mean_serial': get_mean_serial, 'split_range': split_range})
-    args = [(files, start, end, var_names, wt)
-            for start, end in times if start < end]
+    args = [(files, start, end, var_names, times_at_once, wt)
+            for start, end in times]
     data = dv.map(lambda args: get_mean_serial(*args), args)
     # join results
     data = numpy.hstack(data)
@@ -96,11 +122,12 @@ results: the var array along time with each subarray its mean.
 
 def run (files, var_name, start = 0, end = None, parallel = True,
          engines = None, time_name = 'time', lat_name = 'lat',
-         lon_name = 'lon'):
+         lon_name = 'lon', times_at_once = 1000):
     """Run a global mean on a dataset.
 
 run(files, var_name, start = 0, end = None, parallel = True, engines = None,
-    time_name = 'time', lat_name = 'lat', lon_name = 'lon') -> (times, mean)
+    time_name = 'time', lat_name = 'lat', lon_name = 'lon',
+    time_at_once = 1000) -> (times, mean)
 
 files: as taken by netCDF4.MFDataset.
 var_name: the name of the variable to compute the mean of.
@@ -114,6 +141,9 @@ time_name, lat_name, lon_name: the names of these variables.  time can actually
                                be any one-dimensional variable, but longitude
                                and latitude must be 'the' longitude and
                                latitude for var, in standard format.
+times at once: the number of times to retrieve data for before processing it.
+               Note that this much may be in memory at any time on every
+               engine, for parallel runs.
 
 times: an array of times from the time variable, for the given time range.
 mean: a corresponding array of means over the var variable for each time.  Each
@@ -146,29 +176,9 @@ mean: a corresponding array of means over the var variable for each time.  Each
     # run
     var_names = (time_name, lat_name, lon_name, var_name)
     if parallel:
-        results = get_mean_parallel(dv, files, start, end, var_names, wt)
+        results = get_mean_parallel(dv, files, start, end, var_names,
+                                    times_at_once, wt)
     else:
-        results = get_mean_serial(files, start, end, var_names, wt)
+        results = get_mean_serial(files, start, end, var_names, times_at_once,
+                                  wt)
     return time, results
-
-
-def time_bounds (files, time_name = 'time'):
-    """Get first and last times, and length of time variable.
-
-time_bounds(files, time_name = 'time') -> (first, last, length)
-
-files: as taken by netCDF4.MFDataset.
-time_name: the name of the time variable; can actually be any one-dimensional
-           variable.
-
-Times are netCDF4.netcdftime.datetime objects.  If length is 0, times are None.
-
-"""
-    with MFDataset(files) as d:
-        t = d.variables[time_name]
-        l = len(t)
-        if l == 0:
-            times = (None, None)
-        else:
-            times = tuple(num2date((t[0], t[-1]), t.units, t.calendar))
-    return times + (l,)

@@ -1,20 +1,36 @@
 #! /usr/bin/env python
 
 # TODO:
-# - instead of ipython locate, do it manually (then can remove note on needing ipython everywhere)
-# - make valid in Python 2.5/version check
-# - handle user@host-style hostnames
-# - configurable ip* paths - in config, per-host: have "paths": {HOST: [...]}
 # - wait for engines/notebooks on each host in turn to start before moving to next host - in case they haven't loaded the connection file by the time we've changed it
+# - configurable ip* paths - in config, per-host: have "paths": {HOST: [...]}
+# - handle user@host-style hostnames
 # - check for asking for fingerprint confirmation
 # - check for asking for password
 # - verbose option
 # - check for stalled engines
 # - restart processes if they die?  Careful of changed connection files
 
-from sys import exit
+from sys import exit, version_info
+
+ERR_ENV = 1
+ERR_ARGS = 2 # optparse uses this
+ERR_CONF = 3
+ERR_EXEC = 4
+ERR_IO = 5
+
+
+def err (msg, code):
+    """Print an error message and exit."""
+    print 'error:', msg
+    exit(code)
+
+
+# do version check here, since even imports are version-dependent
+if version_info < (2, 5):
+    print err(ERR_ENV, 'Python version is too low; at least 2.5 is required')
+
 from time import strftime, sleep
-from signal import signal, SIGINT, SIGTERM, SIGHUP
+from signal import signal, SIGINT, SIGTERM, SIGHUP, SIGKILL
 import optparse
 import os
 from tempfile import mkstemp
@@ -22,7 +38,13 @@ from shutil import copyfile
 from subprocess import Popen, PIPE
 import shlex
 import socket
-import json
+try:
+    import json
+except ImportError:
+    try:
+        import simplejson as json
+    except ImportError:
+        err(ERR_ENV, 'to use this with Python 2.5, simplejson is required')
 from pipes import quote
 
 USAGE = '%prog [OPTIONS] CONFIG_FILE'
@@ -95,21 +117,18 @@ Known issues:
  - Things will go wrong if your shell configuration files on any remote host
    print anything to stdout.
  - python, ipython, ipcontroller and ipengine are assumed to be on the path
-   where they are used (python and ipython on every host).
+   where they are used.
  - A /lot/ of log files are created in the working directory while running.
 
 To stop this script and all running components, send one of SIGINT (ctrl-C),
 SIGTERM or SIGHUP.
 
 The exit status in the case of an error is:
-    1: invalid configuration file
-    2: couldn't execute a command
-    3: local I/O error'''
-
-ERR_CONF = 1
-ERR_ARGS = 2 # optparse uses this
-ERR_EXEC = 3
-ERR_IO = 4
+    1: insufficient dependencies
+    2: incorrect arguments
+    3: invalid configuration file
+    4: couldn't execute a command
+    5: local I/O error'''
 
 DEBUG = False
 WAIT_TO_KILL = 5
@@ -126,12 +145,6 @@ PORTS = {
     'hb': ((ENGINE, 'hb_ping'), (ENGINE, 'hb_pong')),
     'notifier_port': ((CLIENT, 'notification'),)
 }
-
-
-def err (msg, code):
-    """Print an error message and exit."""
-    print 'error:', msg
-    exit(code)
 
 
 class PreformattedFormatter (optparse.IndentedHelpFormatter):
@@ -300,7 +313,10 @@ configuration file.
             if p.poll() is None:
                 print '[stop]', i
                 try:
-                    p.terminate()
+                    try:
+                        p.terminate()
+                    except AttributeError:
+                        os.kill(p.pid, SIGTERM)
                 except OSError:
                     # already finished
                     pass
@@ -315,7 +331,10 @@ configuration file.
             if p.poll() is None:
                 print '[kill]', i
                 try:
-                    p.kill()
+                    try:
+                        p.kill()
+                    except AttributeError:
+                        os.kill(p.pid, SIGKILL)
                 except OSError:
                     # already finished
                     pass
@@ -424,13 +443,15 @@ Returns the (stdout, stderr) log files written to.
         """Run a command and return its stdout."""
         log_files = self.run_on(host, cmd, ident, True)
         try:
-            with open(log_files[0]) as f:
-                out = f.read()
+            f = open(log_files[0])
+            out = f.read()
         except IOError:
             msg = 'couldn\'t open log file for reading: \'%s\''
             self.bail_out(msg % log_files[0], ERR_IO)
         else:
             return out
+        finally:
+            f.close()
 
     def tunnel (self, host_on, host_to, ports):
         """Open an SSH tunnel between two hosts to forward some ports."""
@@ -499,20 +520,24 @@ Returns the (stdout, stderr) log files written to.
         # edit with ports
         ports = self.get_ports(host_to, ident, 'confile')
         try:
-            with open(f_temp) as f:
-                data = json.load(f)
+            f = open(f_temp)
+            data = json.load(f)
             if not isinstance(data, dict):
                 raise ValueError()
         except (IOError, ValueError):
             self.bail_out('couldn\'t read from file: \'%s\'' % f_temp, ERR_IO)
+        finally:
+            f.close()
         data.update(ports)
         # stop scary warning about not being at location
         data['location'] = '127.0.0.1'
         try:
-            with open(f_temp, 'w') as f:
-                json.dump(data, f, indent = 4)
+            f = open(f_temp, 'w')
+            json.dump(data, f, indent = 4)
         except IOError:
             self.bail_out('couldn\'t write to file: \'%s\'' % f_temp, ERR_IO)
+        finally:
+            f.close()
         # copy to destination
         this_ident = '-'.join((host_to, 'setcon', profile_to, s_ident))
         self.copy_file('localhost', f_temp, host_to, f_to, this_ident)
@@ -718,12 +743,14 @@ if __name__ == '__main__':
     # load configuration file
     config = args[0]
     try:
-        with open(config) as f:
-            config = json.load(f)
+        f = open(config)
+        config = json.load(f)
     except IOError:
         err('configuration file not found', ERR_CONF)
     except ValueError:
         err('invalid configuration file: not valid JSON', ERR_CONF)
+    finally:
+        f.close()
     if not isinstance(config, dict) or 'controller' not in config:
         err('invalid configuration file: a controller is required', ERR_CONF)
     engines = config.get('engines', {})

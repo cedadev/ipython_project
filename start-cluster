@@ -5,7 +5,6 @@
 # - handle user@host-style hostnames
 # - check for asking for fingerprint confirmation
 # - check for asking for password
-# - debug option
 # - restart processes if they die?  Careful of changed connection files
 # - maybe a script to run/track multiple engines like ipcluster, but dies when any die
 # - when start lots of things at once, SSH server sometimes refuses connections
@@ -149,7 +148,6 @@ The exit status in the case of an error is:
     4: couldn't execute a command
     5: local I/O error'''
 
-DEBUG = False
 POLL_WAIT = .1
 WAIT_TO_KILL = 5
 ENGINE = 1
@@ -199,9 +197,11 @@ class PreformattedFormatter (optparse.IndentedHelpFormatter):
 class Launcher:
     """Handles starting up a cluster over SSH, including forwarding ports."""
 
-    def __init__ (self, log_dir, preserve_logs):
+    def __init__ (self, log_dir, preserve_logs, quiet, debug):
         self.log_dir = log_dir
         self.preserve_logs = preserve_logs
+        self.quiet = quiet
+        self.debug = debug
         self.hosts = {}
         self.ipy_dirs = {}
         self.stopping = False
@@ -440,9 +440,10 @@ list of more than one.
         ps = self.processes
         groups = [(t, list(idents if isinstance(idents, list) else [idents]))
                   for t, idents in groups]
-        for t, idents in groups:
-            for ident in idents:
-                print '[wait]', ident
+        if not self.quiet:
+            for t, idents in groups:
+                for ident in idents:
+                    print '[wait]', ident
         # open files
         all_log_files = self.log_files
         all_fs = {}
@@ -499,7 +500,7 @@ list of more than one.
                                                           ERR_EXEC)
                                         else:
                                             # success: done with this process
-                                            if DEBUG:
+                                            if self.debug:
                                                 msg = 'success: %s says, ' \
                                                       '\'%s\' after %s seconds'
                                                 print msg % (ident, s,
@@ -594,9 +595,10 @@ process.
         # run command
         if self.stopping or self._stopped:
             exit(0)
-        print '[start]', ident
+        if not self.quiet or not wait:
+            print '[start]', ident
         printable_cmd = ' '.join(quote(cmd))
-        if DEBUG:
+        if self.debug:
             print printable_cmd
         self._starting = True
         try:
@@ -950,10 +952,18 @@ if __name__ == '__main__':
     op.add_option('-p', '--preserve-logs', action = 'store_true',
                   default = False,
                   help = 'whether to skip deleting log files when exiting')
+    op.add_option('-q', '--quiet', action = 'store_true', default = False,
+                  help = 'show less output (no [wait], and no [start] for ' \
+                         'short-running commands')
+    op.add_option('-b', '--debug', action = 'store_true', default = False,
+                  help = 'show extra debugging output')
     options, args = op.parse_args()
     if not args:
         op.print_help()
         exit(0)
+    if options.quiet and options.debug:
+        op.error('--quiet and --debug options are in conflict: only one is ' \
+                 'allowed')
     # load configuration file
     config = args[0]
     try:
@@ -978,7 +988,8 @@ if __name__ == '__main__':
     if not isinstance(paths, dict):
         err('invalid configuration file: paths must be a dict', ERR_CONF)
     # start launcher
-    l = Launcher(options.log_dir, options.preserve_logs)
+    l = Launcher(options.log_dir, options.preserve_logs, options.quiet,
+                 options.debug)
     for sig in (SIGINT, SIGTERM, SIGHUP):
         signal(sig, l.stop)
     l.launch(config['controller'], engines, notebooks, paths)

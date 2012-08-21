@@ -2,9 +2,7 @@
 
 # TODO:
 # - fill in some error scenarios in wait_for
-# - handle user@host-style hostnames
-# - check for asking for fingerprint confirmation
-# - check for asking for password
+# - handle user@host-style hostnames properly
 # - restart processes if they die?  Careful of changed connection files
 # - maybe a script to run/track multiple engines like ipcluster, but dies when any die
 # - when start lots of things at once, SSH server sometimes refuses connections
@@ -56,7 +54,8 @@ keys:
                         are the numbers of engines to run.
     notebooks [optional]: a list of hosts to run notebook servers on.
     paths [optional]: a dict of paths to IPython executables.  Keys are hosts
-                      and values are {executable: path}, where executables are
+                      and values are {executable: path}.  Any undefined paths
+                      are assumed to be on the shell's path.  Executables are
                       used for:
         ipcontroller: the controller.
         ipengine: all engines.
@@ -66,7 +65,8 @@ keys:
 
 In each case, a host is a dict with keys:
     host: the hostname or IP, as you would pass to SSH to connect to it,
-          excluding the port (user@host is not currently supported).
+          excluding the port (user@host is not currently supported).  This may
+          be user@host, but see a known issue regarding this below.
     port [default = 8888]: Port to listen on for notebook connections.
     profile [default = 'default']: IPython profile to use for this process.
     options: a list of extra command-line options to pass to the notebook
@@ -126,17 +126,15 @@ Log files from every process this script runs are saved in the working
 directory; if something doesn't work, look through these first.
 
 Known issues:
- - Connections might hang on fingerprint confirmation, even if you've made the
-   same connection before, because of the way they are made.  You might need to
-   find these errors in the log files and manually perform all the connections
-   once.
  - SSH connections from the local machine to any host and from any host to the
-   controller's host must be passwordless.
+   controller's should be passwordless - otherwise, you'll probably have to
+   enter passwords lots of times, and things might get messy.
  - Things will go wrong if your shell configuration files on any remote host
    print anything to stdout.
- - python, ipython, ipcontroller and ipengine are assumed to be on the path
-   where they are used.
- - A /lot/ of log files are created in the working directory while running.
+ - Depending on your configuration, a /lot/ of log files may be created in the
+   working directory while running.
+ - If a host is given as user@host, every instance of the host must have the
+   same user explicitly defined.
 
 To stop this script and all running components, send one of SIGINT (ctrl-C),
 SIGTERM or SIGHUP.
@@ -172,6 +170,7 @@ SUCCESS_MATCH = {
     'notebook': ('[NotebookApp] Serving notebooks from',),
 }
 ERROR_MATCH = {
+    None: ('Host key verification failed.', 'Permission denied'), # all
     'controller': (),
     'tunnel': (),
     'engine': (),
@@ -254,7 +253,7 @@ configuration file.
                 if host != c_host:
                     toctrl_hosts[host] = toctrl_hosts.get(host, 0) | t
         hostnames = list(set(hostnames))
-        # make connection host first, if present
+        # make controller host first, if present
         if c_host in hostnames:
             hostnames.insert(0, hostnames.pop(hostnames.index(c_host)))
         # notebook clients
@@ -423,44 +422,14 @@ configuration file.
         self.stop()
         exit(code)
 
-    def wait_for (self, *groups):
-        """Wait for a process to do something.
+    def _wait_for (self, groups, all_fs):
+        """Like wait_for, but also takes files to read from.
 
-Each argument is (type, idents), idents a process identifier to watch, or a
-list of more than one.
+Returns (err_msg, err_code, allow_for_stop) or None.
 
 """
-
-        def close_fs ():
-            for fs in all_fs.itervalues():
-                for f in fs:
-                    f.close()
-
         t0 = time()
         ps = self.processes
-        groups = [(t, list(idents if isinstance(idents, list) else [idents]))
-                  for t, idents in groups]
-        if not self.quiet:
-            for t, idents in groups:
-                for ident in idents:
-                    print '[wait]', ident
-        # open files
-        all_log_files = self.log_files
-        all_fs = {}
-        for t, idents in groups:
-            for ident in idents:
-                all_fs[ident] = fs = []
-                log_files = all_log_files[ident]
-                for i, log_file in enumerate(all_log_files[ident]):
-                    try:
-                        f = open(log_file)
-                    except IOError:
-                        msg = 'couldn\'t open log file for reading: \'%s\''
-                        self.bail_out(msg % log_file, ERR_IO)
-                        close_fs()
-                        # current file wasn't opened
-                    else:
-                        fs.append(f)
         # wait for success/error strings
         done = False
         got_timeout = True
@@ -471,17 +440,14 @@ list of more than one.
             g_rm = []
             for t, idents in groups:
                 success = SUCCESS_MATCH[t]
-                error = ERROR_MATCH[t]
+                error = ERROR_MATCH[t] + ERROR_MATCH[None]
                 i_rm = []
                 for ident in idents:
                     p = ps[ident][0]
                     if p.poll() is not None:
                         # process has finished
-                        close_fs()
-                        if self.stopping or self._stopped:
-                            exit(0)
-                        self.bail_out('process ended unexpectedly: %s' % ident,
-                                      ERR_EXEC)
+                        return ('process ended unexpectedly: %s' % ident,
+                                ERR_EXEC, True)
                     fs = all_fs[ident]
                     # check for strings
                     p_done = False
@@ -496,8 +462,8 @@ list of more than one.
                                             # wow, indent
                                             close_fs()
                                             msg = 'process %s says, \'%s\''
-                                            self.bail_out(msg % (ident, s),
-                                                          ERR_EXEC)
+                                            return (msg % (ident, s), ERR_EXEC,
+                                                    False)
                                         else:
                                             # success: done with this process
                                             if self.debug:
@@ -526,12 +492,55 @@ list of more than one.
                 done = True
                 got_timeout = False
             sleep(POLL_WAIT)
-        # clean up
-        close_fs()
         if got_timeout:
             msg = 'components didn\'t start in %s seconds:\n\t'
             msg += '\n\t'.join(sum((idents for t, idents in groups), []))
-            self.bail_out(msg % COMPONENT_TIMEOUT, ERR_EXEC)
+            return (msg % COMPONENT_TIMEOUT, ERR_EXEC, True)
+
+    def wait_for (self, *groups):
+        """Wait for a process to do something.
+
+Each argument is (type, idents), idents a process identifier to watch, or a
+list of more than one.
+
+"""
+
+        def close_fs ():
+            for fs in all_fs.itervalues():
+                for f in fs:
+                    f.close()
+
+        groups = [(t, list(idents if isinstance(idents, list) else [idents]))
+                  for t, idents in groups]
+        if not self.quiet:
+            for t, idents in groups:
+                for ident in idents:
+                    print '[wait]', ident
+        # open files
+        all_log_files = self.log_files
+        all_fs = {}
+        for t, idents in groups:
+            for ident in idents:
+                all_fs[ident] = fs = []
+                log_files = all_log_files[ident]
+                for i, log_file in enumerate(all_log_files[ident]):
+                    try:
+                        f = open(log_file)
+                    except IOError:
+                        msg = 'couldn\'t open log file for reading: \'%s\''
+                        self.bail_out(msg % log_file, ERR_IO)
+                        close_fs()
+                        # current file wasn't opened
+                    else:
+                        fs.append(f)
+        error = self._wait_for(groups, all_fs)
+        # clean up
+        close_fs()
+        if error is not None:
+            msg, code, check_stop = error
+            if check_stop and (self.stopping or self._stopped):
+                exit(0)
+            self.bail_out(msg, code)
 
     def mk_log_files (self, *data):
         """Return stdout/stderr log file names for a process.
@@ -830,8 +839,14 @@ name, names, ips = socket.gethostbyname_ex(socket.gethostname())
 print '\\n'.join([name] + names + ips)
 '''), 'get-hostnames')
                 hosts = [h.strip() for h in hosts.split('\n') if h.strip()]
+                shost = host.split('@')
+                if len(shost) == 2:
+                    # got user@host: add user@ to every host
+                    user = shost[0]
+                    hosts = ['@'.join((user, h)) for h in hosts]
                 hosts.append(host)
                 host = hosts[0]
+            print hosts
             for h in set(hosts):
                 all_hosts[h] = host
         data[0] = host

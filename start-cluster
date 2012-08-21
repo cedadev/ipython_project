@@ -1,14 +1,15 @@
 #! /usr/bin/env python
 
 # TODO:
-# - wait for engines/notebooks on each host in turn to start before moving to next host - in case they haven't loaded the connection file by the time we've changed it
+# - fill in some error scenarios in wait_for
 # - configurable ip* paths - in config, per-host: have "paths": {HOST: [...]}
 # - handle user@host-style hostnames
 # - check for asking for fingerprint confirmation
 # - check for asking for password
-# - verbose option
-# - check for stalled engines
+# - debug option
 # - restart processes if they die?  Careful of changed connection files
+# - maybe a script to run/track multiple engines like ipcluster, but dies when any die
+# - when start lots of things at once, SSH server sometimes refuses connections
 
 from sys import exit, version_info
 
@@ -29,7 +30,7 @@ def err (msg, code):
 if version_info < (2, 5):
     print err(ERR_ENV, 'Python version is too low; at least 2.5 is required')
 
-from time import strftime, sleep
+from time import strftime, sleep, time
 from signal import signal, SIGINT, SIGTERM, SIGHUP, SIGKILL
 import optparse
 import os
@@ -131,6 +132,7 @@ The exit status in the case of an error is:
     5: local I/O error'''
 
 DEBUG = False
+POLL_WAIT = .1
 WAIT_TO_KILL = 5
 ENGINE = 1
 CLIENT = 2
@@ -144,6 +146,20 @@ PORTS = {
     'iopub': ((CLIENT, 'iopub'), (ENGINE, 'iopub')),
     'hb': ((ENGINE, 'hb_ping'), (ENGINE, 'hb_pong')),
     'notifier_port': ((CLIENT, 'notification'),)
+}
+COMPONENT_TIMEOUT = 10
+# each is (stdout, stderr), each a list of strings to look for
+SUCCESS_MATCH = {
+    'controller': ('[scheduler] Scheduler started',),
+    'tunnel': ('[start-cluster] tunnel: success',),
+    'engine': ('[IPEngineApp] Registering with controller',),
+    'notebook': ('[NotebookApp] Serving notebooks from',),
+}
+ERROR_MATCH = {
+    'controller': (),
+    'tunnel': (),
+    'engine': (),
+    'notebook': ()
 }
 
 
@@ -163,7 +179,8 @@ class Launcher:
         self.hosts = {}
         self.ports = {}
         self.ipy_dirs = {}
-        self.processes = []
+        self.processes = {}
+        self.log_files = {}
         self.open_fs = []
         self.stopping = False
         self._stopped = True
@@ -229,7 +246,7 @@ configuration file.
         # controller: pass options for ports so we know what they are
         port_opts = self.get_ports(c_host, ALL, 'cmdline')
         cmd = ['ipcontroller', '--profile=%s' % c_profile] + port_opts
-        self.run_on(c_host, cmd, 'controller')
+        c_ident = self.run_on(c_host, cmd, 'controller')
         # get ports to forward to controller
         c_ports = self.get_ports(c_host, ALL, 'ident')
         for host, types in toctrl_hosts.iteritems():
@@ -240,16 +257,22 @@ configuration file.
         for host in toctrl_hosts:
             toctrl_hosts_new.setdefault(host, []).extend(toctrl_hosts[host])
         # forward ports
+        t_idents = {}
         for to_host, hosts in connecting_hosts.iteritems():
             for host, ports in hosts.iteritems():
-                self.tunnel(host, to_host, ports)
+                ident = self.tunnel(host, to_host, ports)
+                t_idents.setdefault(host, []).append(ident)
+        # wait for controller to initialise
+        self.wait_for(('controller', c_ident))
         # for both engines and notebooks, some might share a filesystem with
         # the controller, so to avoid connection file clashes, start the
         # controller's first, then those on each host in turn
         for host in hostnames:
-            print '[sleep] 1'
-            sleep(1)
+            # wait for this host's tunnels
+            if host in t_idents:
+                self.wait_for(('tunnel', t_idents[host]))
             # engines
+            e_idents = []
             done = {}
             for engine, num in engines.iteritems():
                 e_host, e_profile = self.host(engine)
@@ -261,9 +284,10 @@ configuration file.
                     n = done.get(e_profile, 0)
                     cmd = ('ipengine', '--profile=%s' % e_profile)
                     ident = '%s-engine-%s' % (e_profile, n + i)
-                    self.run_on(e_host, cmd, ident)
+                    e_idents.append(self.run_on(e_host, cmd, ident))
                 done[e_profile] = num
             # notebooks
+            n_idents = []
             done = {}
             for notebook in notebooks:
                 n_host, n_port, n_profile, opts = self.host(notebook, 'nb')[:4]
@@ -272,14 +296,24 @@ configuration file.
                 self.copy_con_file(c_host, c_profile, n_host, n_profile,
                                    CLIENT)
                 opts = [str(o) for o in opts]
-                if n_host != 'localhost':
+                if n_host != 'localhost' and '--no-browser' not in opts:
                     # running remotely, so running a browser is silly
                     opts.append('--no-browser')
                 cmd = ['ipython', 'notebook', '--profile=%s' % n_profile,
                        '--port=%s' % n_port] + opts
-                i = done.get(n_profile, 0)
-                self.run_on(n_host, cmd, '%s-notebook-%s' % (n_profile, i))
+                ident = '%s-notebook-%s' % (n_profile, done.get(n_profile, 0))
+                n_idents.append(self.run_on(n_host, cmd, ident))
                 done[n_profile] = i + 1
+            # wait for this host's components to read their connection files
+            # before we start anything on the next host, so that we haven't
+            # modified them before this host has read them
+            wait_for = []
+            if e_idents:
+                wait_for.append(('engine', e_idents))
+            if n_idents:
+                wait_for.append(('notebook', n_idents))
+            self.wait_for(*wait_for)
+        print 'initialisation finished'
 
     def wait (self):
         """Do nothing until the launcher is stopped or a subprocess dies."""
@@ -293,7 +327,8 @@ configuration file.
             if not ps:
                 err('no processes running: stopping...', ERR_EXEC)
             # or any subprocesses have stopped
-            finished = [i for i, p, w in ps if not w and p.poll() is not None]
+            finished = [i for i, (p, w) in ps.iteritems()
+                        if not w and p.poll() is not None]
             if finished:
                 msg = 'one or more processes died:\n\t' + '\n\t'.join(finished)
                 self.bail_out(msg, ERR_EXEC)
@@ -302,14 +337,14 @@ configuration file.
     def stop (self, *args):
         """Stop all subprocesses."""
         while self._starting:
-            sleep(.1)
+            sleep(POLL_WAIT)
         if self.stopping or self._stopped:
             return
         print 'stopping processes...'
         self.stopping = True
         # try TERM
         ps = self.processes
-        for i, p, w in ps:
+        for i, (p, w) in ps.iteritems():
             if p.poll() is None:
                 print '[stop]', i
                 try:
@@ -321,13 +356,13 @@ configuration file.
                     # already finished
                     pass
         # wait for a while
-        for j in xrange(int(WAIT_TO_KILL / .1)):
-            if any(p.poll() is None for i, p, w in ps):
-                sleep(.1)
+        for j in xrange(int(WAIT_TO_KILL / POLL_WAIT)):
+            if any(p.poll() is None for i, (p, w) in ps.iteritems()):
+                sleep(POLL_WAIT)
             else:
                 break
         # resort to KILL for still-running processes
-        for i, p, w in ps:
+        for i, (p, w) in ps.iteritems():
             if p.poll() is None:
                 print '[kill]', i
                 try:
@@ -356,7 +391,116 @@ configuration file.
         self.stop()
         exit(code)
 
-    def log_files (self, *data):
+    def wait_for (self, *groups):
+        """Wait for a process to do something.
+
+Each argument is (type, idents), idents a process identifier to watch, or a
+list of more than one.
+
+"""
+
+        def close_fs ():
+            for fs in all_fs.itervalues():
+                for f in fs:
+                    f.close()
+
+        t0 = time()
+        ps = self.processes
+        groups = [(t, list(idents if isinstance(idents, list) else [idents]))
+                  for t, idents in groups]
+        for t, idents in groups:
+            for ident in idents:
+                print '[wait]', ident
+        # open files
+        all_log_files = self.log_files
+        all_fs = {}
+        for t, idents in groups:
+            for ident in idents:
+                all_fs[ident] = fs = []
+                log_files = all_log_files[ident]
+                for i, log_file in enumerate(all_log_files[ident]):
+                    try:
+                        f = open(log_file)
+                    except IOError:
+                        msg = 'couldn\'t open log file for reading: \'%s\''
+                        self.bail_out(msg % log_file, ERR_IO)
+                        close_fs()
+                        # current file wasn't opened
+                    else:
+                        fs.append(f)
+        # wait for success/error strings
+        done = False
+        got_timeout = True
+        while not done:
+            if time() - t0 > COMPONENT_TIMEOUT:
+                done = True
+                # but still do one more check
+            g_rm = []
+            for t, idents in groups:
+                success = SUCCESS_MATCH[t]
+                error = ERROR_MATCH[t]
+                i_rm = []
+                for ident in idents:
+                    p = ps[ident][0]
+                    if p.poll() is not None:
+                        # process has finished
+                        close_fs()
+                        if self.stopping or self._stopped:
+                            exit(0)
+                        self.bail_out('process ended unexpectedly: %s' % ident,
+                                      ERR_EXEC)
+                    fs = all_fs[ident]
+                    # check for strings
+                    p_done = False
+                    for is_bad, checks in enumerate((success, error)):
+                        for f in fs:
+                            l = f.readline()
+                            while l:
+                                # check in this line
+                                for s in checks:
+                                    if s in l:
+                                        if is_bad:
+                                            # wow, indent
+                                            close_fs()
+                                            msg = 'process %s says, \'%s\''
+                                            self.bail_out(msg % (ident, s),
+                                                          ERR_EXEC)
+                                        else:
+                                            # success: done with this process
+                                            if DEBUG:
+                                                msg = 'success: %s says, ' \
+                                                      '\'%s\' after %s seconds'
+                                                print msg % (ident, s,
+                                                             time() - t0)
+                                            p_done = True
+                                            break
+                                l = f.readline()
+                    # horrible (no, not the comment)
+                            if p_done:
+                                break
+                        if p_done:
+                            break
+                    if p_done:
+                        i_rm.append(ident)
+                for ident in i_rm:
+                    idents.remove(ident)
+                if not idents:
+                    g_rm.append((t, idents))
+            for g in g_rm:
+                groups.remove(g)
+            if not groups:
+                # everything was successful
+                done = True
+                got_timeout = False
+            sleep(POLL_WAIT)
+        # clean up
+        close_fs()
+        if got_timeout:
+            msg = 'components didn\'t start in %s seconds:\n\t'
+            msg += '\n\t'.join(sum((idents for t, idents in groups), []))
+            self.bail_out(msg % COMPONENT_TIMEOUT, ERR_EXEC)
+
+    def mk_log_files (self, *data):
         """Return stdout/stderr log file names for a process.
 
 Takes any number of arguments, which are just things that identify this
@@ -377,7 +521,7 @@ process.
         while exists(fs[0] + '.log') or exists(fs[1] + '.log'):
             fs[0] += '_'
             fs[1] += '_'
-            ident += '_'
+        assert ident not in self.processes
         fs[0] += '.log'
         fs[1] += '.log'
         return (fs, ident)
@@ -388,6 +532,7 @@ process.
         if DEBUG:
             print printable_cmd
         # open log files
+        self.log_files[ident] = log_files
         fs = []
         for fn in log_files:
             try:
@@ -411,7 +556,7 @@ process.
             self._starting = False
             self.bail_out('couldn\'t run command: \'%s\'' % printable_cmd,
                           ERR_EXEC)
-        self.processes.append((ident, p, wait))
+        self.processes[ident] = (p, wait)
         self._starting = False
         if wait:
             try:
@@ -430,35 +575,44 @@ process.
     def run_on (self, host, cmd, ident, wait = False):
         """Run a command on the given host over SSH.
 
-Returns the (stdout, stderr) log files written to.
+Returns ident.
 
 """
-        log_files, ident = self.log_files(host, ident)
+        log_files, ident = self.mk_log_files(host, ident)
         if host != 'localhost':
             cmd = ('ssh', '-tt', host, ' '.join(quote(arg) for arg in cmd))
         self.run_cmd(cmd, log_files, ident, wait)
-        return log_files
+        return ident
 
     def get_output (self, host, cmd, ident):
         """Run a command and return its stdout."""
-        log_files = self.run_on(host, cmd, ident, True)
+        ident = self.run_on(host, cmd, ident, True)
+        log_files = self.log_files[ident]
         try:
             f = open(log_files[0])
-            out = f.read()
+            try:
+                out = f.read()
+            finally:
+                f.close()
         except IOError:
             msg = 'couldn\'t open log file for reading: \'%s\''
             self.bail_out(msg % log_files[0], ERR_IO)
         else:
             return out
-        finally:
-            f.close()
 
     def tunnel (self, host_on, host_to, ports):
-        """Open an SSH tunnel between two hosts to forward some ports."""
+        """Open an SSH tunnel between two hosts to forward some ports.
+
+Returns ident.
+
+"""
         port_opts = ['-L%s:localhost:%s' % p for p in ports]
         # this will ssh to host_from first, if necessary
-        self.run_on(host_on, ['ssh', host_to, '-N'] + port_opts,
-                    'forward-port')
+        # -N is better, but this makes it possible to determine success
+        # also would allow for no -tt
+        cmd = 'echo "[start-cluster] tunnel: success"; sleep 1000000000'
+        cmd = ['ssh', '-tt'] + port_opts + [host_to, cmd]
+        return self.run_on(host_on, cmd, 'forward-port-' + host_to)
 
     def get_profile_dir (self, host, profile):
         """Get the directory of an IPython profile on the given host."""
@@ -488,7 +642,7 @@ Returns the (stdout, stderr) log files written to.
                 self.bail_out(msg % (f_from, f_to), ERR_IO)
         else:
             # copy over scp
-            log_files, ident = self.log_files(ident)
+            log_files, ident = self.mk_log_files(ident)
             self.run_cmd(('scp', f_from, f_to), log_files, ident, True)
 
     def copy_con_file (self, host_from, profile_from, host_to, profile_to,
@@ -515,29 +669,35 @@ Returns the (stdout, stderr) log files written to.
             os.close(desc)
         except OSError:
             pass
-        this_ident = '-'.join((host_from, 'getcon', profile_from, s_ident))
+        this_ident = '-'.join((host_from, 'getcon', profile_from, host_to,
+                               profile_to, s_ident))
         self.copy_file(host_from, f_from, 'localhost', f_temp, this_ident)
         # edit with ports
         ports = self.get_ports(host_to, ident, 'confile')
+        msg = 'copied connection file is invalid: \'%s\'' % f_temp
         try:
             f = open(f_temp)
-            data = json.load(f)
-            if not isinstance(data, dict):
-                raise ValueError()
-        except (IOError, ValueError):
+            try:
+                data = json.load(f)
+            finally:
+                f.close()
+        except IOError:
             self.bail_out('couldn\'t read from file: \'%s\'' % f_temp, ERR_IO)
-        finally:
-            f.close()
+        except ValueError:
+            self.bail_out(msg, ERR_IO)
+        if not isinstance(data, dict):
+            self.bail_out(msg, ERR_IO)
         data.update(ports)
         # stop scary warning about not being at location
         data['location'] = '127.0.0.1'
         try:
             f = open(f_temp, 'w')
-            json.dump(data, f, indent = 4)
+            try:
+                json.dump(data, f, indent = 4)
+            finally:
+                f.close()
         except IOError:
             self.bail_out('couldn\'t write to file: \'%s\'' % f_temp, ERR_IO)
-        finally:
-            f.close()
         # copy to destination
         this_ident = '-'.join((host_to, 'setcon', profile_to, s_ident))
         self.copy_file('localhost', f_temp, host_to, f_to, this_ident)
@@ -744,13 +904,14 @@ if __name__ == '__main__':
     config = args[0]
     try:
         f = open(config)
-        config = json.load(f)
+        try:
+            config = json.load(f)
+        finally:
+            f.close()
     except IOError:
-        err('configuration file not found', ERR_CONF)
+        err('configuration file not found', ERR_ARGS)
     except ValueError:
         err('invalid configuration file: not valid JSON', ERR_CONF)
-    finally:
-        f.close()
     if not isinstance(config, dict) or 'controller' not in config:
         err('invalid configuration file: a controller is required', ERR_CONF)
     engines = config.get('engines', {})

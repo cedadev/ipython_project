@@ -2,7 +2,6 @@
 
 # TODO:
 # - fill in some error scenarios in wait_for
-# - configurable ip* paths - in config, per-host: have "paths": {HOST: [...]}
 # - handle user@host-style hostnames
 # - check for asking for fingerprint confirmation
 # - check for asking for password
@@ -39,6 +38,7 @@ from shutil import copyfile
 from subprocess import Popen, PIPE
 import shlex
 import socket
+from pipes import quote as quote_single
 try:
     import json
 except ImportError:
@@ -46,7 +46,6 @@ except ImportError:
         import simplejson as json
     except ImportError:
         err(ERR_ENV, 'to use this with Python 2.5, simplejson is required')
-from pipes import quote
 
 USAGE = '%prog [OPTIONS] CONFIG_FILE'
 HELP = '''
@@ -57,6 +56,14 @@ keys:
     engines [optional]: a dict of engines to run.  Keys are hosts and values
                         are the numbers of engines to run.
     notebooks [optional]: a list of hosts to run notebook servers on.
+    paths [optional]: a dict of paths to IPython executables.  Keys are hosts
+                      and values are {executable: path}, where executables are
+                      used for:
+        ipcontroller: the controller.
+        ipengine: all engines.
+        python: all hosts running a component except localhost.
+        ipython: all notebooks, and all engines with a different host or
+                 profile to the controller.
 
 In each case, a host is a dict with keys:
     host: the hostname or IP, as you would pass to SSH to connect to it,
@@ -72,6 +79,7 @@ The accepted keys depends on the type of host:
     notebooks: host, port, profile, options, clients.
     notebook clients: host, port (port is the port on the client to bind the
                       notebook server's port to).
+    paths hosts: host.
     all others: host, profile.
 
 Hosts may also be given as strings or lists.  Lists contain values in the same
@@ -102,7 +110,17 @@ A full example, which runs the controller, notebook server and 2 engines on
             "port": 5000,
             "options": ["--notebook-dir=~/ipython", "--pylab=inline"]
         }
-    ]
+    ],
+    "paths": {
+        "host1": {
+            "ipcontroller": "/opt/ipython/bin/ipcontroller",
+            "ipengine": "/opt/ipython/bin/ipengine",
+            "ipython": "/opt/ipython/bin/ipython"
+        },
+        "host2": {
+            "python": "python2"
+        }
+    }
 }
 
 Log files from every process this script runs are saved in the working
@@ -163,6 +181,14 @@ ERROR_MATCH = {
 }
 
 
+def quote (args):
+    """pipes.quote wrapper to handle lists of args and empty args."""
+    if isinstance(args, basestring):
+        return quote_single(args) if args else '""'
+    else:
+        return [quote_single(s) if s else '""' for s in args]
+
+
 class PreformattedFormatter (optparse.IndentedHelpFormatter):
     """optparse text formatter for preformatted description text."""
 
@@ -174,14 +200,10 @@ class Launcher:
     """Handles starting up a cluster over SSH, including forwarding ports."""
 
     def __init__ (self, log_dir, preserve_logs):
-        self.log_prefix = os.path.join(log_dir, strftime('%F-%T'))
+        self.log_dir = log_dir
         self.preserve_logs = preserve_logs
         self.hosts = {}
-        self.ports = {}
         self.ipy_dirs = {}
-        self.processes = {}
-        self.log_files = {}
-        self.open_fs = []
         self.stopping = False
         self._stopped = True
         self._starting = False
@@ -189,10 +211,10 @@ class Launcher:
         # IPs
         self.host('localhost')
 
-    def launch (self, controller, engines, notebooks):
+    def launch (self, controller, engines, notebooks, paths):
         """Start the cluster.
 
-Takes the 'controller', 'engines' and 'notebooks' fields from the
+Takes the 'controller', 'engines', 'notebooks' and 'paths' fields from the
 configuration file.
 
 """
@@ -201,7 +223,15 @@ configuration file.
         if not self._stopped:
             raise RuntimeError('already running: can\'t launch again')
         self._stopped = False
+        # initialise things
+        self.log_prefix = os.path.join(self.log_dir, strftime('%F-%T'))
+        self.ipy_paths = {}
+        self.ports = {}
+        self.processes = {}
+        self.log_files = {}
+        self.open_fs = []
         self._has_con_file = {ENGINE: [], CLIENT: []}
+        self.add_paths(paths)
         c_host, c_profile = self.host(controller)
         # get hosts that will connect to controller, sort by host, and disallow
         # using notebook ports for controller connections
@@ -245,7 +275,8 @@ configuration file.
                     hosts.setdefault(host, []).append((port, n_port))
         # controller: pass options for ports so we know what they are
         port_opts = self.get_ports(c_host, ALL, 'cmdline')
-        cmd = ['ipcontroller', '--profile=%s' % c_profile] + port_opts
+        cmd = [self.get_path(c_host, 'ipcontroller'),
+               '--profile=%s' % c_profile] + port_opts
         c_ident = self.run_on(c_host, cmd, 'controller')
         # get ports to forward to controller
         c_ports = self.get_ports(c_host, ALL, 'ident')
@@ -282,7 +313,8 @@ configuration file.
                                    ENGINE)
                 for i in xrange(num):
                     n = done.get(e_profile, 0)
-                    cmd = ('ipengine', '--profile=%s' % e_profile)
+                    cmd = (self.get_path(e_host, 'ipengine'),
+                           '--profile=%s' % e_profile)
                     ident = '%s-engine-%s' % (e_profile, n + i)
                     e_idents.append(self.run_on(e_host, cmd, ident))
                 done[e_profile] = num
@@ -299,8 +331,8 @@ configuration file.
                 if n_host != 'localhost' and '--no-browser' not in opts:
                     # running remotely, so running a browser is silly
                     opts.append('--no-browser')
-                cmd = ['ipython', 'notebook', '--profile=%s' % n_profile,
-                       '--port=%s' % n_port] + opts
+                cmd = [self.get_path(n_host, 'ipython'), 'notebook',
+                       '--profile=%s' % n_profile, '--port=%s' % n_port] + opts
                 ident = '%s-notebook-%s' % (n_profile, done.get(n_profile, 0))
                 n_idents.append(self.run_on(n_host, cmd, ident))
                 done[n_profile] = i + 1
@@ -526,11 +558,25 @@ process.
         fs[1] += '.log'
         return (fs, ident)
 
+    def add_paths (self, paths):
+        """Store paths from the configuration file."""
+        stored = self.ipy_paths
+        for host, this_paths in paths.iteritems():
+            if not isinstance(this_paths, dict):
+                msg = 'invalid configuration file: paths values must be ' \
+                      'dict, got %s for host \'%s\''
+                self.bail_out(msg % (repr(this_paths), host), ERR_CONF)
+            host = self.host(host, 'path')[0]
+            this_stored = stored.setdefault(host, {})
+            for cmd, path in this_paths.iteritems():
+                this_stored[cmd] = str(path)
+
+    def get_path (self, host, cmd):
+        """Get the path to an IPython command for the given host."""
+        return self.ipy_paths.get(host, {}).get(cmd, cmd)
+
     def run_cmd (self, cmd, log_files, ident, wait):
         """Run a command and direct its output to log files."""
-        printable_cmd = ' '.join(quote(arg) for arg in cmd)
-        if DEBUG:
-            print printable_cmd
         # open log files
         self.log_files[ident] = log_files
         fs = []
@@ -549,6 +595,9 @@ process.
         if self.stopping or self._stopped:
             exit(0)
         print '[start]', ident
+        printable_cmd = ' '.join(quote(cmd))
+        if DEBUG:
+            print printable_cmd
         self._starting = True
         try:
             p = Popen(cmd, stdin = PIPE, stdout = fs[0], stderr = fs[1])
@@ -580,7 +629,7 @@ Returns ident.
 """
         log_files, ident = self.mk_log_files(host, ident)
         if host != 'localhost':
-            cmd = ('ssh', '-tt', host, ' '.join(quote(arg) for arg in cmd))
+            cmd = ('ssh', '-tt', host, ' '.join(quote(cmd)))
         self.run_cmd(cmd, log_files, ident, wait)
         return ident
 
@@ -620,7 +669,8 @@ Returns ident.
             # retrieve from cache
             ipy_dir = self.ipy_dirs[host]
         else:
-            ipy_dir = self.get_output(host, ('ipython', 'locate'), 'locate')
+            cmd = (self.get_path(host, 'ipython'), 'locate')
+            ipy_dir = self.get_output(host, cmd, 'locate')
             ipy_dir = ipy_dir.strip().rstrip('/')
             # cache result
             self.ipy_dirs[host] = ipy_dir
@@ -716,6 +766,8 @@ Returns ident.
             fields = ['port', 'profile', 'options', 'clients']
         elif component == 'nbclient':
             fields = ['port']
+        elif component == 'path':
+            fields = []
         else:
             fields = ['profile']
         fields.insert(0, 'host')
@@ -769,7 +821,8 @@ Returns ident.
                 hosts = ['localhost', '127.0.0.1', name] + names + ips
             else:
                 # get hosts remotely
-                hosts = self.get_output(host, ('python', '-c', '''
+                py = self.get_path(host, 'python')
+                hosts = self.get_output(host, (py, '-c', '''
 import socket
 name, names, ips = socket.gethostbyname_ex(socket.gethostname())
 print '\\n'.join([name] + names + ips)
@@ -799,7 +852,8 @@ for i in xrange(%s):
         if host == 'localhost':
             exec(core_code % num)
         else:
-            ports = self.get_output(host, ('python', '-c', ('''
+            py = self.get_path(host, 'python')
+            ports = self.get_output(host, (py, '-c', ('''
 import socket
 used_ports = %s
 ''' + core_code + '''
@@ -920,10 +974,13 @@ if __name__ == '__main__':
     notebooks = config.get('notebooks', [])
     if not isinstance(notebooks, list):
         err('invalid configuration file: notebooks must be a list', ERR_CONF)
+    paths = config.get('paths', {})
+    if not isinstance(paths, dict):
+        err('invalid configuration file: paths must be a dict', ERR_CONF)
     # start launcher
     l = Launcher(options.log_dir, options.preserve_logs)
     for sig in (SIGINT, SIGTERM, SIGHUP):
         signal(sig, l.stop)
-    l.launch(config['controller'], engines, notebooks)
+    l.launch(config['controller'], engines, notebooks, paths)
     # wait for a subprocess to die or a signal to this process
     l.wait()

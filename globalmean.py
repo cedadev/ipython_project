@@ -1,5 +1,7 @@
 """A module to compute the seasonal mean over a variable in a dataset.
 
+Depends on IPython, netCDF4 and cdms2.
+
 See the run function.  time_bounds may also be useful.
 
 """
@@ -75,6 +77,8 @@ results: the var array along time with each subarray its mean.
         index[lat_index] = slice(None)
         index[lon_index] = slice(None)
         data = []
+        # read times
+        time = time[start:end]
         # do in time chunks
         n = end - start
         n_pieces = n / times_at_once + bool(n % times_at_once)
@@ -92,7 +96,7 @@ results: the var array along time with each subarray its mean.
                 this_data = this_data.sum(i)
                 indices.pop(i)
             data.append(this_data)
-    return numpy.hstack(data)
+    return (time, numpy.hstack(data))
 
 
 def get_mean_parallel (dv, files, start, end, var_names, times_at_once, wt):
@@ -114,10 +118,9 @@ results: the var array along time with each subarray its mean.
     dv.push({'get_mean_serial': get_mean_serial, 'split_range': split_range})
     args = [(files, start, end, var_names, times_at_once, wt)
             for start, end in times]
-    data = dv.map(lambda args: get_mean_serial(*args), args)
+    times, data = zip(*dv.map(lambda args: get_mean_serial(*args), args))
     # join results
-    data = numpy.hstack(data)
-    return data
+    return (numpy.hstack(times), numpy.hstack(data))
 
 
 def run (files, var_name, start = 0, end = None, parallel = True,
@@ -158,21 +161,21 @@ mean: a corresponding array of means over the var variable for each time.  Each
         dv.block = True
         dv.execute('import numpy')
         dv.execute('from netCDF4 import MFDataset')
-    # get end time
-    with MFDataset(files) as d:
-        time = d.variables[time_name]
-        if end is None:
-            end = len(time)
-        time = time[start:end]
     # get weightings
     fs = files
-    if not isinstance(fs, list):
+    if isinstance(fs, basestring):
         fs = glob(fs)
     f = cdms2.open(fs[0])
     try:
         wt = numpy.outer(*f[var_name].getGrid().getWeights())
     finally:
         f.close()
+    with MFDataset(files) as d:
+        # get end time
+        time = d.variables[time_name]
+        n = len(time)
+        if end is None or end > n:
+            end = n
     # run
     var_names = (time_name, lat_name, lon_name, var_name)
     if parallel:
@@ -181,4 +184,4 @@ mean: a corresponding array of means over the var variable for each time.  Each
     else:
         results = get_mean_serial(files, start, end, var_names, times_at_once,
                                   wt)
-    return time, results
+    return results

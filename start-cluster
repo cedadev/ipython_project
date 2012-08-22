@@ -47,8 +47,11 @@ except ImportError:
 USAGE = '%prog [OPTIONS] CONFIG_FILE'
 HELP = '''
 This script starts an IPython cluster across multiple machines according to the
-configuration file CONFIG_FILE.  This is a JSON file containing a dict with
-keys:
+configuration file CONFIG_FILE.  It requires Python 2.5 or later 2.x, and the
+development version of IPython.  If using Python 2.5, the simplejson package
+is required.
+
+CONFIG_FILE is a JSON file containing a dict with keys:
     controller: controller host.
     engines [optional]: a dict of engines to run.  Keys are hosts and values
                         are the numbers of engines to run.
@@ -107,7 +110,8 @@ A full example, which runs the controller, notebook server and 2 engines on
         {
             "host": "host1",
             "port": 5000,
-            "options": ["--notebook-dir=~/ipython", "--pylab=inline"]
+            "options": ["--notebook-dir=~/ipython", "--pylab=inline"],
+            "clients": ["localhost:5000"]
         }
     ],
     "paths": {
@@ -332,7 +336,8 @@ configuration file.
                     opts.append('--no-browser')
                 cmd = [self.get_path(n_host, 'ipython'), 'notebook',
                        '--profile=%s' % n_profile, '--port=%s' % n_port] + opts
-                ident = '%s-notebook-%s' % (n_profile, done.get(n_profile, 0))
+                i = done.get(n_profile, 0)
+                ident = '%s-notebook-%s' % (n_profile, i)
                 n_idents.append(self.run_on(n_host, cmd, ident))
                 done[n_profile] = i + 1
             # wait for this host's components to read their connection files
@@ -846,7 +851,6 @@ print '\\n'.join([name] + names + ips)
                     hosts = ['@'.join((user, h)) for h in hosts]
                 hosts.append(host)
                 host = hosts[0]
-            print hosts
             for h in set(hosts):
                 all_hosts[h] = host
         data[0] = host

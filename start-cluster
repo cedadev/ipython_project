@@ -1,7 +1,6 @@
 #! /usr/bin/env python
 
 # TODO:
-# - specify port ranges
 # - handle user@host-style hostnames properly
 # - restart processes if they die?  Careful of changed connection files
 
@@ -28,6 +27,7 @@ from time import strftime, sleep, time
 from signal import signal, SIGINT, SIGTERM, SIGHUP, SIGKILL
 import optparse
 import os
+from collections import defaultdict
 from tempfile import mkstemp
 from shutil import copyfile
 from subprocess import Popen, PIPE
@@ -63,6 +63,10 @@ CONFIG_FILE is a JSON file containing a dict with keys:
         python: all hosts running a component except localhost.
         ipython: all notebooks, and all engines with a different host or
                  profile to the controller.
+    ports [optional]: a dict of port ranges to assign ports in.  Keys are hosts
+                      and values are [min_port, max_port], where endpoints are
+                      included (or just [min_port]).  This does not apply to
+                      the notebook server's port.
 
 In each case, a host is a dict with keys:
     host: the hostname or IP, as you would pass to SSH to connect to it,
@@ -209,6 +213,7 @@ class Launcher:
         self.debug = debug
         self.hosts = {}
         self.ipy_dirs = {}
+        self.port_ranges = defaultdict(lambda: (0, 2 ** 16 - 1), {})
         self.stopping = False
         self._stopped = True
         self._starting = False
@@ -216,11 +221,11 @@ class Launcher:
         # IPs
         self.host('localhost')
 
-    def launch (self, controller, engines, notebooks, paths):
+    def launch (self, controller, engines, notebooks, paths, ports):
         """Start the cluster.
 
-Takes the 'controller', 'engines', 'notebooks' and 'paths' fields from the
-configuration file.
+Takes the 'controller', 'engines', 'notebooks', 'paths' and 'ports' fields from
+the configuration file.
 
 """
         if self.stopping:
@@ -237,6 +242,7 @@ configuration file.
         self.open_fs = []
         self._has_con_file = {ENGINE: [], CLIENT: []}
         self.add_paths(paths)
+        self.add_port_ranges(ports)
         c_host, c_profile = self.host(controller)
         # get hosts that will connect to controller, sort by host, and disallow
         # using notebook ports for controller connections
@@ -592,6 +598,25 @@ process.
             for cmd, path in this_paths.iteritems():
                 this_stored[cmd] = str(path)
 
+    def add_port_ranges (self, ports):
+        """Store port ranges from the configuration file."""
+        stored = self.port_ranges
+        for host, this_ports in ports.iteritems():
+            if not isinstance(this_ports, list) \
+               or len(this_ports) not in (1, 2) \
+               or not all(isinstance(p, int) for p in this_ports):
+                msg = 'invalid configuration file: ports values must be ' \
+                      '1- or 2-length list of ints, got %s for host \'%s\''
+                self.bail_out(msg % (repr(this_ports), host), ERR_CONF)
+            # fill in missing max
+            if len(this_ports) == 1:
+                this_ports.append(2 ** 16 - 1)
+            # enforce bounds
+            this_ports[0] = max(0, this_ports[0])
+            this_ports[1] = min(2 ** 16 - 1, this_ports[1])
+            # store
+            stored[self.host(host, 'path')[0]] = this_ports
+
     def get_path (self, host, cmd):
         """Get the path to an IPython command for the given host."""
         return self.ipy_paths.get(host, {}).get(cmd, cmd)
@@ -864,31 +889,60 @@ print '\\n'.join([name] + names + ips)
         data[0] = host
         return data
 
-    def _get_ports (self, host, num, used_ports, ident):
+    def _get_ports (self, host, mn_port, mx_port, num, used_ports, ident):
         """Get a number of suitable ports on the given host."""
         core_code = '''
-ports = []
-for i in xrange(%s):
-    while True:
-        sock = socket.socket()
-        sock.bind(('', 0))
-        port = sock.getsockname()[1]
-        sock.close()
-        if port not in ports and port not in used_ports:
-            ports.append(port)
-            break
+mn_port = %s
+mx_port = %s
+need = %s
+ports = set()
+bad_ports = set()
+pool = set(range(mn_port, mx_port + 1)) - set(used_ports)
+while True:
+    this_need = need - len(ports)
+    if this_need == 0:
+        break
+    assert this_need > 0
+    try:
+        attempts = sample(pool, this_need)
+    except ValueError:
+        %s
+        break
+    for port in attempts:
+        try:
+            s = socket.socket()
+            s.bind(('', port))
+        except socket.error:
+            bad_ports.add(port)
+            pass
+        else:
+            s.close()
+            ports.add(port)
+    pool -= ports
+    pool -= bad_ports
 '''
+        err = 'not enough open ports in the given range (%s to %s)'
+        err = err % (mn_port,mx_port)
         if host == 'localhost':
-            exec(core_code % num)
+            exec(core_code % (mn_port, mx_port, num, 'ports = None'))
         else:
             py = self.get_path(host, 'python')
             ports = self.get_output(host, (py, '-c', ('''
 import socket
+from random import sample
 used_ports = %s
 ''' + core_code + '''
 print '\\n'.join(str(p) for p in ports)
-''') % (repr(used_ports), num)), ident)
-            ports = [int(p.strip()) for p in ports.split('\n') if p.strip()]
+''') % (repr(used_ports), mn_port, mx_port, num, 'print \'%s\'' % err)), ident)
+            ports = ports.strip()
+            if ports == err:
+                ports = None
+            else:
+                ports = [int(p.strip())
+                         for p in ports.split('\n') if p.strip()]
+        if ports is None:
+            # couldn't allocate ports
+            self.bail_out(err, ERR_CONF)
         return ports
 
     def get_ports (self, host, types, format = None):
@@ -930,7 +984,8 @@ list: just a list of port numbers.
                 ident = 'get-ports-client'
             else:
                 ident = 'get-ports-all'
-            new = self._get_ports(host, need, used, ident)
+            mn, mx = self.port_ranges[host]
+            new = self._get_ports(host, mn, mx, need, used, ident)
         else:
             new = []
         # store and retrieve ports
@@ -1021,11 +1076,14 @@ if __name__ == '__main__':
     paths = config.get('paths', {})
     if not isinstance(paths, dict):
         err('invalid configuration file: paths must be a dict', ERR_CONF)
+    ports = config.get('ports', {})
+    if not isinstance(ports, dict):
+        err('invalid configuration file: ports must be a dict', ERR_CONF)
     # start launcher
     l = Launcher(options.log_dir, options.preserve_logs, options.startup_delay,
                  options.quiet, options.debug)
     for sig in (SIGINT, SIGTERM, SIGHUP):
         signal(sig, l.stop)
-    l.launch(config['controller'], engines, notebooks, paths)
+    l.launch(config['controller'], engines, notebooks, paths, ports)
     # wait for a subprocess to die or a signal to this process
     l.wait()

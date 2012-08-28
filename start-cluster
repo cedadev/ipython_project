@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # TODO:
-# - fill in some error scenarios in wait_for
+# - specify port ranges
 # - handle user@host-style hostnames properly
 # - restart processes if they die?  Careful of changed connection files
 
@@ -149,6 +149,7 @@ The exit status in the case of an error is:
     5: local I/O error'''
 
 POLL_WAIT = .1
+TUNNEL_WAIT = 1
 WAIT_TO_KILL = 5
 ENGINE = 1
 CLIENT = 2
@@ -169,14 +170,16 @@ SUCCESS_MATCH = {
     'controller': ('[scheduler] Scheduler started',),
     'tunnel': ('[start-cluster] tunnel: success',),
     'engine': ('[IPEngineApp] Registering with controller',),
-    'notebook': ('[NotebookApp] Serving notebooks from',),
+    'notebook': ('[NotebookApp] The IPython Notebook is running at:',),
 }
 ERROR_MATCH = {
     None: ('Host key verification failed.', 'Permission denied'), # all
-    'controller': (),
-    'tunnel': (),
+    'controller': ('registration::purging stalled registration:',),
+    'tunnel': ('bind: Address already in use',
+               'channel_setup_fwd_listener: cannot listen to port:',
+               'Could not request local forwarding.'),
     'engine': (),
-    'notebook': ()
+    'notebook': ('is already in use, trying another random port.',)
 }
 
 
@@ -290,20 +293,19 @@ configuration file.
         for host in toctrl_hosts:
             toctrl_hosts_new.setdefault(host, []).extend(toctrl_hosts[host])
         # forward ports
-        t_idents = {}
+        t_idents = []
         for to_host, hosts in connecting_hosts.iteritems():
             for host, ports in hosts.iteritems():
                 ident = self.tunnel(host, to_host, ports)
-                t_idents.setdefault(host, []).append(ident)
+                t_idents.append(ident)
         # wait for controller to initialise
         self.wait_for(('controller', c_ident))
+        # wait for tunnels
+        self.wait_for(('tunnel', t_idents))
         # for both engines and notebooks, some might share a filesystem with
         # the controller, so to avoid connection file clashes, start the
         # controller's first, then those on each host in turn
         for host in hostnames:
-            # wait for this host's tunnels
-            if host in t_idents:
-                self.wait_for(('tunnel', t_idents[host]))
             # engines
             e_idents = []
             done = {}
@@ -430,6 +432,12 @@ configuration file.
         self.stop()
         exit(code)
 
+    def _close_fs (self, all_fs):
+        """Used by wait_for."""
+        for fs in all_fs.itervalues():
+            for f in fs:
+                f.close()
+
     def _wait_for (self, groups, all_fs):
         """Like wait_for, but also takes files to read from.
 
@@ -459,29 +467,30 @@ Returns (err_msg, err_code, allow_for_stop) or None.
                     fs = all_fs[ident]
                     # check for strings
                     p_done = False
-                    for is_bad, checks in enumerate((success, error)):
-                        for f in fs:
-                            l = f.readline()
-                            while l:
+                    for f in fs:
+                        l = f.readline()
+                        while l:
+                            l = l.strip()
+                            for is_bad, checks in enumerate((success, error)):
                                 # check in this line
                                 for s in checks:
                                     if s in l:
                                         if is_bad:
                                             # wow, indent
-                                            close_fs()
+                                            self._close_fs(all_fs)
                                             msg = 'process %s says, \'%s\''
-                                            return (msg % (ident, s), ERR_EXEC,
+                                            return (msg % (ident, l), ERR_EXEC,
                                                     False)
                                         else:
                                             # success: done with this process
                                             if self.debug:
                                                 msg = 'success: %s says, ' \
                                                       '\'%s\' after %s seconds'
-                                                print msg % (ident, s,
+                                                print msg % (ident, l,
                                                              time() - t0)
                                             p_done = True
                                             break
-                                l = f.readline()
+                            l = f.readline()
                     # horrible (no, not the comment)
                             if p_done:
                                 break
@@ -512,12 +521,6 @@ Each argument is (type, idents), idents a process identifier to watch, or a
 list of more than one.
 
 """
-
-        def close_fs ():
-            for fs in all_fs.itervalues():
-                for f in fs:
-                    f.close()
-
         groups = [(t, list(idents if isinstance(idents, list) else [idents]))
                   for t, idents in groups]
         if not self.quiet:
@@ -537,13 +540,13 @@ list of more than one.
                     except IOError:
                         msg = 'couldn\'t open log file for reading: \'%s\''
                         self.bail_out(msg % log_file, ERR_IO)
-                        close_fs()
+                        self._close_fs(all_fs)
                         # current file wasn't opened
                     else:
                         fs.append(f)
         error = self._wait_for(groups, all_fs)
         # clean up
-        close_fs()
+        self._close_fs(all_fs)
         if error is not None:
             msg, code, check_stop = error
             if check_stop and (self.stopping or self._stopped):
@@ -678,7 +681,9 @@ Returns ident.
         # this will ssh to host_from first, if necessary
         # -N is better, but this makes it possible to determine success
         # also would allow for no -tt
-        cmd = 'echo "[start-cluster] tunnel: success"; sleep 1000000000'
+        cmd = ';'.join(('sleep %s' % TUNNEL_WAIT,
+                        'echo "[start-cluster] tunnel: success"',
+                        'sleep 1000000000'))
         cmd = ['ssh', '-tt'] + port_opts + [host_to, cmd]
         return self.run_on(host_on, cmd, 'forward-port-' + host_to)
 

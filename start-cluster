@@ -2,7 +2,12 @@
 
 # TODO:
 # - handle user@host-style hostnames properly
-# - restart processes if they die?  Careful of changed connection files
+# - restart processes if they die?  Retransfer connection files if needed (shouldn't matter they've already been changed).
+# - option to not use ssh?
+#   - have nossh key, list of hosts
+#   - plus ssh[default:true] option per nbclient
+#   - still have to transfer files, run setup commands over ssh - note in help
+#   - just don't have tunnels from these hosts, and have ssh="" in confiles
 
 from sys import exit, version_info
 
@@ -213,7 +218,6 @@ class Launcher:
         self.debug = debug
         self.hosts = {}
         self.ipy_dirs = {}
-        self.port_ranges = defaultdict(lambda: (0, 2 ** 16 - 1), {})
         self.stopping = False
         self._stopped = True
         self._starting = False
@@ -221,11 +225,34 @@ class Launcher:
         # IPs
         self.host('localhost')
 
-    def launch (self, controller, engines, notebooks, paths, ports):
+    def load_config (self, fn):
+        # load configuration file
+        try:
+            f = open(fn)
+            try:
+                config = json.load(f)
+            finally:
+                f.close()
+        except IOError:
+            err('configuration file not found', ERR_ARGS)
+        except ValueError:
+            err('invalid configuration file: not valid JSON', ERR_CONF)
+        # check keys
+        if not isinstance(config, dict) or 'controller' not in config:
+            err('invalid configuration file: a controller is required', ERR_CONF)
+        items = (('engines', dict), ('notebooks', list),
+                ('paths', dict), ('ports', dict))
+        for k, t in items:
+            if not isinstance(config.setdefault(k, t()), t):
+                msg = 'invalid configuration file: %s must be a %s'
+                err(msg % (k, t.__name__), ERR_CONF)
+        ks = ('controller',) + zip(*items)[0]
+        return [config[k] for k in ks]
+
+    def launch (self, fn):
         """Start the cluster.
 
-Takes the 'controller', 'engines', 'notebooks', 'paths' and 'ports' fields from
-the configuration file.
+Takes the configuration file path.
 
 """
         if self.stopping:
@@ -233,9 +260,12 @@ the configuration file.
         if not self._stopped:
             raise RuntimeError('already running: can\'t launch again')
         self._stopped = False
+        # load config
+        controller, engines, notebooks, paths, ports = self.load_config(fn)
         # initialise things
         self.log_prefix = os.path.join(self.log_dir, strftime('%F-%T'))
         self.ipy_paths = {}
+        self.port_ranges = defaultdict(lambda: (0, 2 ** 16 - 1), {})
         self.ports = {}
         self.processes = {}
         self.log_files = {}
@@ -1053,37 +1083,11 @@ if __name__ == '__main__':
     if options.quiet and options.debug:
         op.error('--quiet and --debug options are in conflict: only one is ' \
                  'allowed')
-    # load configuration file
-    config = args[0]
-    try:
-        f = open(config)
-        try:
-            config = json.load(f)
-        finally:
-            f.close()
-    except IOError:
-        err('configuration file not found', ERR_ARGS)
-    except ValueError:
-        err('invalid configuration file: not valid JSON', ERR_CONF)
-    if not isinstance(config, dict) or 'controller' not in config:
-        err('invalid configuration file: a controller is required', ERR_CONF)
-    engines = config.get('engines', {})
-    if not isinstance(engines, dict):
-        err('invalid configuration file: engines must be a dict', ERR_CONF)
-    notebooks = config.get('notebooks', [])
-    if not isinstance(notebooks, list):
-        err('invalid configuration file: notebooks must be a list', ERR_CONF)
-    paths = config.get('paths', {})
-    if not isinstance(paths, dict):
-        err('invalid configuration file: paths must be a dict', ERR_CONF)
-    ports = config.get('ports', {})
-    if not isinstance(ports, dict):
-        err('invalid configuration file: ports must be a dict', ERR_CONF)
     # start launcher
     l = Launcher(options.log_dir, options.preserve_logs, options.startup_delay,
                  options.quiet, options.debug)
     for sig in (SIGINT, SIGTERM, SIGHUP):
         signal(sig, l.stop)
-    l.launch(config['controller'], engines, notebooks, paths, ports)
+    l.launch(args[0])
     # wait for a subprocess to die or a signal to this process
     l.wait()

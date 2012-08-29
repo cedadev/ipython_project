@@ -31,6 +31,7 @@ if version_info < (2, 5):
 from time import strftime, sleep, time
 from signal import signal, SIGINT, SIGTERM, SIGHUP, SIGKILL
 import optparse
+from random import sample
 import os
 from collections import defaultdict
 from tempfile import mkstemp
@@ -955,6 +956,7 @@ while True:
         err = err % (mn_port,mx_port)
         if host == 'localhost':
             exec(core_code % (mn_port, mx_port, num, 'ports = None'))
+            ports = list(ports)
         else:
             py = self.get_path(host, 'python')
             ports = self.get_output(host, (py, '-c', ('''

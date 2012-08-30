@@ -277,7 +277,6 @@ Takes the configuration file path.
         self.add_port_ranges(ports)
         c_host, c_profile, c_nossh = self.host(controller, 'controller')
         c_rhost = self.raw_host(c_host)
-        c_ports = self.get_ports(c_host, ALL, 'ident')
         # get controller's nossh hosts
         c_nossh = [self.raw_host(self.host(host)) for host in c_nossh]
         self.nossh = [(host, c_rhost) for host in c_nossh]
@@ -285,6 +284,7 @@ Takes the configuration file path.
         # disallow using notebook ports for controller connections
         toctrl_hosts = {}
         hostnames = []
+        copy_ports = []
         for t, hosts in ((ENGINE, engines), (CLIENT, notebooks)):
             for host in hosts:
                 data = self.host(host, 'engine' if t == ENGINE else 'notebook')
@@ -301,9 +301,8 @@ Takes the configuration file path.
                     this_used.append(port)
                 if rhost != c_rhost:
                     if (rhost, c_rhost) in self.nossh:
-                        # no forwarding: ports are controller's (we know rhost
-                        # has no ports yet, and c_rhost has all of them)
-                        self.ports[rhost] = self.ports[c_rhost]
+                        # no forwarding
+                        copy_ports.append(rhost)
                     else:
                         this_tc_hosts = toctrl_hosts.setdefault(rhost,
                                                                 [host, 0])
@@ -337,7 +336,11 @@ Takes the configuration file path.
         if c_nossh:
             cmd.append('--ip=*')
         c_ident = self.run_on(c_host, cmd, 'controller')
+        # copy ports for non-ssh-using components
+        for rhost in copy_ports:
+            self.ports[rhost] = self.ports[c_rhost]
         # get ports to forward to controller
+        c_ports = self.get_ports(c_host, ALL, 'ident')
         for rhost, (host, types) in toctrl_hosts.iteritems():
             ports = self.get_ports(host, types, 'ident')
             ports = [(ports[ident], c_ports[ident]) for ident in ports]

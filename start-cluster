@@ -3,7 +3,6 @@
 # TODO:
 # - using su instead of ssh for otheruser@localhost would be nice
 # - restart processes if they die?  Retransfer connection files if needed (shouldn't matter they've already been changed).
-# - have ssh[default:true] option per nbclient
 
 from sys import exit, version_info
 
@@ -75,23 +74,24 @@ In each case, a host is a dict with keys:
     host: the hostname or IP, as you would pass to SSH to connect to it,
           excluding the port (possibly user@host - this should always be given
           if needed to connect to that host via SSH).
-    port [default = 8888]: Port to listen on for notebook connections.
+    port [default = 8888]: Port for notebook connections.
     profile [default = 'default']: IPython profile to use for this process.
     nossh: a list of hosts that shouldn't use SSH port forwarding to the
            controller's host for its components.  SSH is still required to run
            processes on the controller, even if this list contains localhost.
+           Using this should give a little performance increase in transferring
+           data.
     options: a list of extra command-line options to pass to the notebook
              server (should not contain --port).  --no-browser is appended
              automatically if this is not running on the local machine.
-    clients: a list of hosts to forward the notebook's port to.
+    clients: a list of hosts with ports to forward the notebook's port to.
 
 The accepted keys depends on the type of host:
     controller: host, profile, nossh.
     nossh hosts: host.
     engines: host, profile.
     notebooks: host, port, profile, options, clients.
-    notebook clients: host, port (port is the port on the client to bind the
-                      notebook server's port to).
+    notebook clients: host, port.
     paths hosts: host.
     ports: host.
 
@@ -328,9 +328,8 @@ Takes the configuration file path.
                     msg = 'multiple components are using port %s on %s'
                     self.bail_out(msg % (port, rhost), ERR_CONF)
                 this_used.append(port)
-                if rhost != n_rhost:
-                    this_hosts = hosts.setdefault(rhost, [host, []])
-                    this_hosts[1].append((port, n_port))
+                this_hosts = hosts.setdefault(rhost, [host, []])
+                this_hosts[1].append((port, n_port))
         # controller: pass options for ports so we know what they are
         port_opts = self.get_ports(c_host, ALL, 'cmdline')
         cmd = [self.get_path(c_host, 'ipcontroller'),
@@ -908,6 +907,8 @@ Returns ident.
                 continue
             t = types.get(k, str)
             if not isinstance(v, t):
+                if t is bool and isinstance(v, basestring):
+                    v = v in ('true', 'True', '1')
                 try:
                     v = t(v)
                 except (TypeError, ValueError):
@@ -923,7 +924,7 @@ Returns ident.
             data.append(None)
         for i, k in enumerate(fields):
             # check for: just appended None, or was empty in the string
-            if not data[i]:
+            if data[i] is None or data[i] == '':
                 data[i] = defaults[k]
         host = data[0]
         # get all names and add to storage

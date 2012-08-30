@@ -3,11 +3,7 @@
 # TODO:
 # - using su instead of ssh for otheruser@localhost would be nice
 # - restart processes if they die?  Retransfer connection files if needed (shouldn't matter they've already been changed).
-# - option to not use ssh?
-#   - have nossh key, list of hosts
-#   - plus ssh[default:true] option per nbclient
-#   - still have to transfer files, run setup commands over ssh - note in help
-#   - just don't have tunnels from these hosts, and have ssh="" in confiles
+# - have ssh[default:true] option per nbclient
 
 from sys import exit, version_info
 
@@ -77,21 +73,27 @@ CONFIG_FILE is a JSON file containing a dict with keys:
 
 In each case, a host is a dict with keys:
     host: the hostname or IP, as you would pass to SSH to connect to it,
-          excluding the port (possibly user@host).
+          excluding the port (possibly user@host - this should always be given
+          if needed to connect to that host via SSH).
     port [default = 8888]: Port to listen on for notebook connections.
     profile [default = 'default']: IPython profile to use for this process.
+    nossh: a list of hosts that shouldn't use SSH port forwarding to the
+           controller's host for its components.  SSH is still required to run
+           processes on the controller, even if this list contains localhost.
     options: a list of extra command-line options to pass to the notebook
              server (should not contain --port).  --no-browser is appended
              automatically if this is not running on the local machine.
     clients: a list of hosts to forward the notebook's port to.
 
 The accepted keys depends on the type of host:
+    controller: host, profile, nossh.
+    nossh hosts: host.
+    engines: host, profile.
     notebooks: host, port, profile, options, clients.
     notebook clients: host, port (port is the port on the client to bind the
                       notebook server's port to).
     paths hosts: host.
     ports: host.
-    all others: host, profile.
 
 Hosts may also be given as strings or lists.  Lists contain values in the same
 order as keys are listed above, and possibly truncated to exclude any trailing
@@ -224,7 +226,7 @@ class Launcher:
         # add localhost so that we don't ssh to aliases for it to check their
         # IPs
         self.uname = getuser()
-        self.localhost = self.host('@'.join((self.uname, 'localhost')))[0]
+        self.localhost = self.host('@'.join((self.uname, 'localhost')))
 
     def load_config (self, fn):
         # load configuration file
@@ -265,25 +267,27 @@ Takes the configuration file path.
         controller, engines, notebooks, paths, ports = self.load_config(fn)
         # initialise things
         self.log_prefix = os.path.join(self.log_dir, strftime('%F-%T'))
-        self.ipy_paths = {}
-        self.port_ranges = defaultdict(lambda: (0, 2 ** 16 - 1), {})
-        self.ports = {}
-        self._used_ports = used_ports = {}
-        self.processes = {}
         self.log_files = {}
+        self.processes = {}
         self.open_fs = []
         self._has_con_file = {ENGINE: [], CLIENT: []}
+        self.ports = {}
+        self._used_ports = used_ports = {}
         self.add_paths(paths)
         self.add_port_ranges(ports)
-        c_host, c_profile = self.host(controller)
-        # get hosts that will connect to controller, sort by host, and disallow
-        # using notebook ports for controller connections
+        c_host, c_profile, c_nossh = self.host(controller, 'controller')
         c_rhost = self.raw_host(c_host)
+        c_ports = self.get_ports(c_host, ALL, 'ident')
+        # get controller's nossh hosts
+        c_nossh = [self.raw_host(self.host(host)) for host in c_nossh]
+        self.nossh = [(host, c_rhost) for host in c_nossh]
+        # get hosts that will connect to controller via SSH, sort by host, and
+        # disallow using notebook ports for controller connections
         toctrl_hosts = {}
         hostnames = []
         for t, hosts in ((ENGINE, engines), (CLIENT, notebooks)):
             for host in hosts:
-                data = self.host(host, None if t == ENGINE else 'nb')
+                data = self.host(host, 'engine' if t == ENGINE else 'notebook')
                 host = data[0]
                 hostnames.append(host)
                 rhost = self.raw_host(host)
@@ -296,8 +300,14 @@ Takes the configuration file path.
                         self.bail_out(msg % (port, rhost), ERR_CONF)
                     this_used.append(port)
                 if rhost != c_rhost:
-                    this_tc_hosts = toctrl_hosts.setdefault(rhost, [host, 0])
-                    this_tc_hosts[1] |= t
+                    if (rhost, c_rhost) in self.nossh:
+                        # no forwarding: ports are controller's (we know rhost
+                        # has no ports yet, and c_rhost has all of them)
+                        self.ports[rhost] = self.ports[c_rhost]
+                    else:
+                        this_tc_hosts = toctrl_hosts.setdefault(rhost,
+                                                                [host, 0])
+                        this_tc_hosts[1] |= t
         hostnames = list(set(hostnames))
         # make controller host first, if present
         if c_host in hostnames:
@@ -305,7 +315,7 @@ Takes the configuration file path.
         # notebook clients
         connecting_hosts = {}
         for notebook in notebooks:
-            data = self.host(notebook, 'nb')
+            data = self.host(notebook, 'notebook')
             n_host, n_port = data[:2]
             n_rhost = self.raw_host(n_host)
             hosts = connecting_hosts.setdefault(n_rhost, [n_host, {}])[1]
@@ -325,9 +335,10 @@ Takes the configuration file path.
         port_opts = self.get_ports(c_host, ALL, 'cmdline')
         cmd = [self.get_path(c_host, 'ipcontroller'),
                '--profile=%s' % c_profile] + port_opts
+        if c_nossh:
+            cmd.append('--ip=*')
         c_ident = self.run_on(c_host, cmd, 'controller')
         # get ports to forward to controller
-        c_ports = self.get_ports(c_host, ALL, 'ident')
         for rhost, (host, types) in toctrl_hosts.iteritems():
             ports = self.get_ports(host, types, 'ident')
             ports = [(ports[ident], c_ports[ident]) for ident in ports]
@@ -358,7 +369,7 @@ Takes the configuration file path.
             e_idents = []
             done = {}
             for engine, num in engines.iteritems():
-                e_host, e_profile = self.host(engine)
+                e_host, e_profile = self.host(engine, 'engine')
                 if e_host != host:
                     continue
                 self.copy_con_file(c_host, c_profile, e_host, e_profile,
@@ -376,7 +387,8 @@ Takes the configuration file path.
             n_idents = []
             done = {}
             for notebook in notebooks:
-                n_host, n_port, n_profile, opts = self.host(notebook, 'nb')[:4]
+                data = self.host(notebook, 'notebook')
+                n_host, n_port, n_profile, opts = data[:4]
                 if n_host != host:
                     continue
                 self.copy_con_file(c_host, c_profile, n_host, n_profile,
@@ -629,7 +641,7 @@ process.
 
     def add_paths (self, paths):
         """Store paths from the configuration file."""
-        stored = self.ipy_paths
+        self.ipy_paths = stored = {}
         for host, this_paths in paths.iteritems():
             if not isinstance(this_paths, dict):
                 msg = 'invalid configuration file: paths values must be ' \
@@ -637,14 +649,14 @@ process.
                 self.bail_out(msg % (repr(this_paths), host), ERR_CONF)
             # pass python path to host because it's not in ipy_paths yet
             py = str(this_paths.get('python', 'python'))
-            host = self.host(host, 'basic', py)[0]
+            host = self.host(host, py = py)
             this_stored = stored.setdefault(host, {})
             for cmd, path in this_paths.iteritems():
                 this_stored[cmd] = str(path)
 
     def add_port_ranges (self, ports):
         """Store port ranges from the configuration file."""
-        stored = self.port_ranges
+        self.port_ranges = stored = defaultdict(lambda: (0, 2 ** 16 - 1), {})
         for host, this_ports in ports.iteritems():
             if not isinstance(this_ports, list) \
                or len(this_ports) not in (1, 2) \
@@ -659,7 +671,7 @@ process.
             this_ports[0] = max(0, this_ports[0])
             this_ports[1] = min(2 ** 16 - 1, this_ports[1])
             # store
-            host = self.raw_host(self.host(host, 'basic')[0])
+            host = self.raw_host(self.host(host))
             stored[host] = this_ports
 
     def get_path (self, host, cmd):
@@ -830,8 +842,16 @@ Returns ident.
         if not isinstance(data, dict):
             self.bail_out(msg, ERR_IO)
         data.update(ports)
-        # stop scary warning about not being at location
-        data['location'] = '127.0.0.1'
+        rhost_from = self.raw_host(host_from)
+        if (self.raw_host(host_to), rhost_from) in self.nossh:
+            # make sure location is correct
+            try:
+                data['location'] = socket.gethostbyname(rhost_from)
+            except socket.gaierror:
+                self.bail_out('unknown host: \'%s\'' % rhost_from, ERR_CONF)
+        else:
+            # stop scary warning about not being at location
+            data['location'] = '127.0.0.1'
         try:
             f = open(f_temp, 'w')
             try:
@@ -851,18 +871,21 @@ Returns ident.
 
     def host (self, host, component = None, py = None):
         """Parse configuration host object and register aliases."""
-        types = {'port': int, 'options': list, 'clients': list}
-        defaults = {'port': 8888, 'profile': 'default', 'options': [],
-                    'clients': []}
-        if component == 'nb':
+        types = {'port': int, 'nossh': list, 'options': list, 'clients': list}
+        defaults = {'port': 8888, 'profile': 'default', 'nossh': [],
+                    'options': [], 'clients': []}
+        if component == 'controller':
+            fields = ['profile', 'nossh']
+        elif component == 'engine':
+            fields = ['profile']
+        elif component == 'notebook':
             fields = ['port', 'profile', 'options', 'clients']
         elif component == 'nbclient':
             fields = ['port']
-        elif component == 'basic':
-            fields = []
         else:
-            fields = ['profile']
+            fields = []
         fields.insert(0, 'host')
+        req_fields = [k for k in fields if k not in defaults]
         if isinstance(host, basestring):
             # ':'-separated fields in a string
             data = host.split(':')
@@ -893,6 +916,9 @@ Returns ident.
             data[i] = v
         # fill in defaults
         data = data[:len(fields)]
+        if len(data) < len(req_fields):
+            msg = 'invalid host format: %s; need compulsory arguments %s'
+            self.bail_out(msg % (repr(data), req_fields), ERR_CONF)
         while len(data) < len(fields):
             data.append(None)
         for i, k in enumerate(fields):
@@ -934,8 +960,11 @@ print '\\n'.join([name] + names + ips)
                 all_hosts[h] = host
         # add user back
         host = '@'.join((user, host))
-        data[0] = host
-        return data
+        if len(data) == 1:
+            return host
+        else:
+            data[0] = host
+            return data
 
     def cmp_host (self, host1, host2):
         """Compare two hosts, ignoring usernames."""
@@ -963,7 +992,7 @@ while True:
         attempts = sample(pool, this_need)
     except ValueError:
         %s
-        break
+        exit(0)
     for port in attempts:
         try:
             s = socket.socket()

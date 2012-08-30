@@ -102,7 +102,8 @@ Hosts may also be given as strings or lists.  Lists contain values in the same
 order as keys are listed above, and possibly truncated to exclude any trailing
 optional arguments.  Strings contain the same arguments separated by `:'
 characters; leave sections empty for defaults, and note that this form cannot
-handle arguments that are lists.  For example, the following are equivalent:
+handle arguments that are lists (or, of course, arguments containing `:').  For
+example, the following are equivalent controller or engine definitions:
     "somehost"
     "somehost:default"
     ["somehost"]
@@ -141,19 +142,21 @@ A full example, which runs the controller, notebook server and 2 engines on
 }
 
 Log files from every process this script runs are saved in the working
-directory; if something doesn't work, look through these first.
+directory; if something doesn't work, look through these first (using the `-p'
+option to keep them around if necessary).
 
 Known issues:
  - SSH connections from the local machine to any host and from any host to the
    controller's should be passwordless - otherwise, you'll probably have to
    enter passwords lots of times, and things might get messy.
- - Things will go wrong if your shell configuration files on any remote host
-   print anything to stdout.
+ - Things will go wrong if your shell's login configuration files on any remote
+   host print anything to stdout, and if they print some really strange things
+   to stderr.
  - Depending on your configuration, a /lot/ of log files may be created in the
    working directory while running.
 
 To stop this script and all running components, send one of SIGINT (ctrl-C),
-SIGTERM or SIGHUP.
+SIGTERM or SIGHUP to it.
 
 The exit status in the case of an error is:
     1: insufficient dependencies

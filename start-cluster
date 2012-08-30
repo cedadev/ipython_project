@@ -85,12 +85,15 @@ In each case, a host is a dict with keys:
              server (should not contain --port).  --no-browser is appended
              automatically if this is not running on the local machine.
     clients: a list of hosts with ports to forward the notebook's port to.
+    external [default = false]: whether to listen on external IP addresses, so
+                                that connections can be made from other hosts
+                                without SSH port forwarding.
 
 The accepted keys depends on the type of host:
     controller: host, profile, nossh.
     nossh hosts: host.
     engines: host, profile.
-    notebooks: host, port, profile, options, clients.
+    notebooks: host, port, profile, options, clients, external.
     notebook clients: host, port.
     paths hosts: host.
     ports: host.
@@ -390,7 +393,7 @@ Takes the configuration file path.
             done = {}
             for notebook in notebooks:
                 data = self.host(notebook, 'notebook')
-                n_host, n_port, n_profile, opts = data[:4]
+                n_host, n_port, n_profile, opts, clients, external = data
                 if n_host != host:
                     continue
                 self.copy_con_file(c_host, c_profile, n_host, n_profile,
@@ -401,6 +404,8 @@ Takes the configuration file path.
                     opts.append('--no-browser')
                 cmd = [self.get_path(n_host, 'ipython'), 'notebook',
                        '--profile=%s' % n_profile, '--port=%s' % n_port] + opts
+                if external:
+                    cmd.append('--ip=*')
                 i = done.get(n_profile, 0)
                 ident = '%s-notebook-%s' % (n_profile, i)
                 n_idents.append(self.run_on(n_host, cmd, ident))
@@ -873,15 +878,16 @@ Returns ident.
 
     def host (self, host, component = None, py = None):
         """Parse configuration host object and register aliases."""
-        types = {'port': int, 'nossh': list, 'options': list, 'clients': list}
+        types = {'port': int, 'nossh': list, 'options': list, 'clients': list,
+                 'external': bool}
         defaults = {'port': 8888, 'profile': 'default', 'nossh': [],
-                    'options': [], 'clients': []}
+                    'options': [], 'clients': [], 'external': False}
         if component == 'controller':
             fields = ['profile', 'nossh']
         elif component == 'engine':
             fields = ['profile']
         elif component == 'notebook':
-            fields = ['port', 'profile', 'options', 'clients']
+            fields = ['port', 'profile', 'options', 'clients', 'external']
         elif component == 'nbclient':
             fields = ['port']
         else:

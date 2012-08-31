@@ -1007,15 +1007,17 @@ while True:
         %s
         exit(0)
     for port in attempts:
+        s = socket.socket()
+        # if a process that was using the port has exited recently, we need
+        # this for socket to treat it as free
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            s = socket.socket()
             s.bind(('', port))
         except socket.error:
             bad_ports.add(port)
-            pass
         else:
-            s.close()
             ports.add(port)
+        s.close()
     pool -= ports
     pool -= bad_ports
 '''
@@ -1034,11 +1036,15 @@ used_ports = %s
 print '\\n'.join(str(p) for p in ports)
 ''') % (repr(used_ports), mn_port, mx_port, num, 'print \'%s\'' % err)), ident)
             ports = ports.strip()
-            if ports == err:
+            if ports.splitlines()[-1].strip() == err:
                 ports = None
             else:
-                ports = [int(p.strip())
-                         for p in ports.split('\n') if p.strip()]
+                try:
+                    ports = [int(p.strip())
+                             for p in ports.split('\n') if p.strip()]
+                except ValueError:
+                    msg = 'get-ports process returned unexpected output'
+                    self.bail_out(msg, ERR_EXEC)
         if ports is None:
             # couldn't allocate ports
             self.bail_out(err, ERR_CONF)

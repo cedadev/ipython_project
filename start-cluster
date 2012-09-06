@@ -167,6 +167,7 @@ The exit status in the case of an error is:
 
 POLL_WAIT = .1
 TUNNEL_WAIT = 1
+ALIVE_CHECK_WAIT = 1
 WAIT_TO_KILL = 5
 ENGINE = 1
 CLIENT = 2
@@ -181,7 +182,6 @@ PORTS = {
     'hb': ((ENGINE, 'hb_ping'), (ENGINE, 'hb_pong')),
     'notifier_port': ((CLIENT, 'notification'),)
 }
-COMPONENT_TIMEOUT = 10
 # each is (stdout, stderr), each a list of strings to look for
 SUCCESS_MATCH = {
     'controller': ('[scheduler] Scheduler started',),
@@ -218,10 +218,12 @@ class PreformattedFormatter (optparse.IndentedHelpFormatter):
 class Launcher:
     """Handles starting up a cluster over SSH, including forwarding ports."""
 
-    def __init__ (self, log_dir, preserve_logs, startup_delay, quiet, debug):
+    def __init__ (self, log_dir, preserve_logs, startup_delay, timeout, quiet,
+                  debug):
         self.log_dir = log_dir
         self.preserve_logs = preserve_logs
         self.startup_delay = startup_delay
+        self.timeout = timeout
         self.quiet = quiet
         self.debug = debug
         self.hosts = {}
@@ -443,7 +445,7 @@ Takes the configuration file path.
             if finished:
                 msg = 'one or more processes died:\n\t' + '\n\t'.join(finished)
                 self.bail_out(msg, ERR_EXEC)
-            sleep(1)
+            sleep(ALIVE_CHECK_WAIT)
 
     def stop (self, *args):
         """Stop all subprocesses."""
@@ -520,7 +522,7 @@ Returns (err_msg, err_code, allow_for_stop) or None.
         done = False
         got_timeout = True
         while not done:
-            if time() - t0 > COMPONENT_TIMEOUT:
+            if time() - t0 > self.timeout:
                 done = True
                 # but still do one more check
             g_rm = []
@@ -582,7 +584,7 @@ Returns (err_msg, err_code, allow_for_stop) or None.
         if got_timeout:
             msg = 'components didn\'t start in %s seconds:\n\t'
             msg += '\n\t'.join(sum((idents for t, idents in groups), []))
-            return (msg % COMPONENT_TIMEOUT, ERR_EXEC, True)
+            return (msg % self.timeout, ERR_EXEC, True)
 
     def wait_for (self, *groups):
         """Wait for a process to do something.
@@ -1148,6 +1150,10 @@ if __name__ == '__main__':
                          'you have trouble with lots of engines.  This is ' \
                          'not used for local components, and can be ' \
                          'fractional (default: 0)')
+    op.add_option('-m', '--timeout', action = 'store', type = 'float',
+                  default = 10,
+                  help = 'number of seconds to wait for components to ' \
+                         'start; can be fractional (default: 10)')
     op.add_option('-q', '--quiet', action = 'store_true', default = False,
                   help = 'show less output (no [wait], and no [start] for ' \
                          'short-running commands')
@@ -1162,7 +1168,7 @@ if __name__ == '__main__':
                  'allowed')
     # start launcher
     l = Launcher(options.log_dir, options.preserve_logs, options.startup_delay,
-                 options.quiet, options.debug)
+                 options.timeout, options.quiet, options.debug)
     for sig in (SIGINT, SIGTERM, SIGHUP):
         signal(sig, l.stop)
     l.launch(args[0])

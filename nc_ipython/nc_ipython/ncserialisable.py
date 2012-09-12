@@ -13,7 +13,8 @@ in netCDF4.  The only differences are (should be):
 For notes on serialisation, see the documentation for Dataset.
 
 If you want to replace netCDF4 with this module, so that libraries that use it
-don't need to change their imports, then before importing them, do:
+don't need to change their imports, then before importing them (but after
+importing this module), do:
 
     import sys
     sys.modules['netCDF4'] = sys.modules['ncserialisable']

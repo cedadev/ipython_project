@@ -1,7 +1,6 @@
 #! /usr/bin/env python
 
 # TODO:
-# - using su instead of ssh for otheruser@localhost would be nice
 # - restart processes if they die?  Retransfer connection files if needed (shouldn't matter they've already been changed).
 
 from sys import exit, version_info
@@ -84,14 +83,18 @@ In each case, a host is a dict with keys:
     options: a list of extra command-line options to pass to the notebook
              server (should not contain --port).  --no-browser is appended
              automatically if this is not running on the local machine.
-    clients: a list of hosts with ports to forward the notebook's port to.
+    clients: a list of hosts with ports to forward this component's port(s) to.
+             For notebooks this is the listening port; for controllers, this is
+             the client ports.  Controller clients also have the client
+             connection file copied to them.
     external [default = false]: whether to listen on external IP addresses, so
                                 that connections can be made from other hosts
                                 without SSH port forwarding.
 
 The accepted keys depends on the type of host:
-    controller: host, profile, nossh.
+    controller: host, profile, nossh, clients.
     nossh hosts: host.
+    controller clients: host, profile.
     engines: host, profile.
     notebooks: host, port, profile, options, clients, external.
     notebook clients: host, port.
@@ -234,7 +237,7 @@ class Launcher:
         # add localhost so that we don't ssh to aliases for it to check their
         # IPs
         self.uname = getuser()
-        self.localhost = self.host('@'.join((self.uname, 'localhost')))
+        self.localhost = self.host('@'.join((self.uname, 'localhost')))[0]
 
     def load_config (self, fn):
         # load configuration file
@@ -283,23 +286,26 @@ Takes the configuration file path.
         self._used_ports = used_ports = {}
         self.add_paths(paths)
         self.add_port_ranges(ports)
-        c_host, c_profile, c_nossh = self.host(controller, 'controller')
+        c_host, c_profile, c_nossh, c_clients = self.host(controller,
+                                                          'controller')
         c_rhost = self.raw_host(c_host)
         # get controller's nossh hosts
-        c_nossh = [self.raw_host(self.host(host)) for host in c_nossh]
+        c_nossh = [self.raw_host(self.host(host)[0]) for host in c_nossh]
         self.nossh = [(host, c_rhost) for host in c_nossh]
         # get hosts that will connect to controller via SSH, sort by host, and
         # disallow using notebook ports for controller connections
         toctrl_hosts = {}
-        hostnames = []
+        hostnames = set()
         copy_ports = []
-        for t, hosts in ((ENGINE, engines), (CLIENT, notebooks)):
+        for t, port_t, hosts in (('engine', ENGINE, engines),
+                                 ('notebook', CLIENT, notebooks),
+                                 (None, CLIENT, c_clients)):
             for host in hosts:
-                data = self.host(host, 'engine' if t == ENGINE else 'notebook')
+                data = self.host(host, t)
                 host = data[0]
-                hostnames.append(host)
+                hostnames.add(host)
                 rhost = self.raw_host(host)
-                if t == CLIENT:
+                if t == 'notebook':
                     # add notebook port to list, and check for conflicts
                     port = data[1]
                     this_used = used_ports.setdefault(rhost, [])
@@ -314,8 +320,8 @@ Takes the configuration file path.
                     else:
                         this_tc_hosts = toctrl_hosts.setdefault(rhost,
                                                                 [host, 0])
-                        this_tc_hosts[1] |= t
-        hostnames = list(set(hostnames))
+                        this_tc_hosts[1] |= port_t
+        hostnames = list(hostnames)
         # make controller host first, if present
         if c_host in hostnames:
             hostnames.insert(0, hostnames.pop(hostnames.index(c_host)))
@@ -367,6 +373,10 @@ Takes the configuration file path.
                         host = self.localhost
                     ident = self.tunnel(host, to_host, ports)
                     t_idents.append(ident)
+        # copy connection files for controller clients
+        for client in c_clients:
+            host, profile = self.host(client, 'cclient')
+            self.copy_con_file(c_host, c_profile, host, profile, CLIENT)
         # wait for controller to initialise
         self.wait_for(('controller', c_ident))
         # wait for tunnels
@@ -661,7 +671,7 @@ process.
                 self.bail_out(msg % (repr(this_paths), host), ERR_CONF)
             # pass python path to host because it's not in ipy_paths yet
             py = str(this_paths.get('python', 'python'))
-            host = self.host(host, py = py)
+            host = self.host(host, py = py)[0]
             this_stored = stored.setdefault(host, {})
             for cmd, path in this_paths.iteritems():
                 this_stored[cmd] = str(path)
@@ -683,7 +693,7 @@ process.
             this_ports[0] = max(0, this_ports[0])
             this_ports[1] = min(2 ** 16 - 1, this_ports[1])
             # store
-            host = self.raw_host(self.host(host))
+            host = self.raw_host(self.host(host)[0])
             stored[host] = this_ports
 
     def get_path (self, host, cmd):
@@ -888,8 +898,8 @@ Returns ident.
         defaults = {'port': 8888, 'profile': 'default', 'nossh': [],
                     'options': [], 'clients': [], 'external': False}
         if component == 'controller':
-            fields = ['profile', 'nossh']
-        elif component == 'engine':
+            fields = ['profile', 'nossh', 'clients']
+        elif component in ('engine', 'cclient'):
             fields = ['profile']
         elif component == 'notebook':
             fields = ['port', 'profile', 'options', 'clients', 'external']
@@ -975,11 +985,8 @@ print '\\n'.join([name] + names + ips)
                 all_hosts[h] = host
         # add user back
         host = '@'.join((user, host))
-        if len(data) == 1:
-            return host
-        else:
-            data[0] = host
-            return data
+        data[0] = host
+        return data
 
     def cmp_host (self, host1, host2):
         """Compare two hosts, ignoring usernames."""

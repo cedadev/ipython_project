@@ -17,10 +17,6 @@ from subprocess import Popen, PIPE, STDOUT
 from pipes import quote as quote_single
 from webbrowser import open as open_url
 
-# TODO:
-# - in setconf, if clobbering, don't bother fetching remote list
-# - in getconf, can do this and just handle errors through scp?
-
 # utilities
 
 class Formatter (optparse.IndentedHelpFormatter):
@@ -140,8 +136,7 @@ def check_ssh ():
     except OSError:
         warn('couldn\'t run ssh-add')
     else:
-        out = p.communicate()[0]
-        rtn = p.returncode
+        rtn = p.wait()
         if rtn == 1:
             warn('ssh-agent doesn\'t appear to have any keys')
         elif rtn == 2:
